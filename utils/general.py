@@ -786,6 +786,10 @@ def non_max_suppression(prediction,
          list of detections, on (n,6) tensor per image [xyxy, conf, cls]
     """
 
+    # Se 'prediction' for uma tupla, pegamos a parte de predição
+    if isinstance(prediction, tuple):
+        prediction = prediction[0]  # A primeira parte da tupla é o tensor de predições
+
     bs = prediction.shape[0]  # batch size
     nc = prediction.shape[2] - 5  # number of classes
     xc = prediction[..., 4] > conf_thres  # candidates
@@ -795,7 +799,6 @@ def non_max_suppression(prediction,
     assert 0 <= iou_thres <= 1, f'Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0'
 
     # Settings
-    # min_wh = 2  # (pixels) minimum box width and height
     max_wh = 7680  # (pixels) maximum box width and height
     max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
     time_limit = 0.1 + 0.03 * bs  # seconds to quit after
@@ -806,8 +809,6 @@ def non_max_suppression(prediction,
     t = time.time()
     output = [torch.zeros((0, 6), device=prediction.device)] * bs
     for xi, x in enumerate(prediction):  # image index, image inference
-        # Apply constraints
-        # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
         x = x[xc[xi]]  # confidence
 
         # Cat apriori labels if autolabelling
@@ -819,7 +820,6 @@ def non_max_suppression(prediction,
             v[range(len(lb)), lb[:, 0].long() + 5] = 1.0  # cls
             x = torch.cat((x, v), 0)
 
-        # If none remain process next image
         if not x.shape[0]:
             continue
 
@@ -841,10 +841,6 @@ def non_max_suppression(prediction,
         if classes is not None:
             x = x[(x[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
 
-        # Apply finite constraint
-        # if not torch.isfinite(x).all():
-        #     x = x[torch.isfinite(x).all(1)]
-
         # Check shape
         n = x.shape[0]  # number of boxes
         if not n:  # no boxes
@@ -859,7 +855,6 @@ def non_max_suppression(prediction,
         if i.shape[0] > max_det:  # limit detections
             i = i[:max_det]
         if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
-            # update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
             iou = box_iou(boxes[i], boxes) > iou_thres  # iou matrix
             weights = iou * scores[None]  # box weights
             x[i, :4] = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
@@ -872,6 +867,7 @@ def non_max_suppression(prediction,
             break  # time limit exceeded
 
     return output
+
 
 
 def strip_optimizer(f='best.pt', s=''):  # from utils.general import *; strip_optimizer()

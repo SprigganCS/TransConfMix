@@ -31,6 +31,7 @@ from pathlib import Path
 
 import torch
 import torch.backends.cudnn as cudnn
+import json
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -104,6 +105,8 @@ def run(
         bs = 1  # batch_size
     vid_path, vid_writer = [None] * bs, [None] * bs
 
+    results_json = {}
+
     # Run inference
     model.warmup(imgsz=(1 if pt else bs, 3, *imgsz))  # warmup
     dt, seen = [0.0, 0.0, 0.0], 0
@@ -146,6 +149,10 @@ def run(
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+           
+            key = p.name 
+            boxes, labels, confidences = [], [], []
+
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
@@ -157,6 +164,12 @@ def run(
 
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
+                    x1, y1, x2, y2 = [coord.item() for coord in xyxy]   # floats
+                    boxes.append([x1, y1, x2, y2])
+                    labels.append(names[int(cls)])  
+                    confidences.append(conf.item())
+
+
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
                         line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
@@ -169,6 +182,13 @@ def run(
                         annotator.box_label(xyxy, label, color=colors(c, True))
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
+
+
+            if boxes:
+                results_json[key] = {"boxes": boxes, "labels": labels, "confidences": confidences}
+
+            
+            
 
             # Stream results
             im0 = annotator.result()
@@ -197,6 +217,11 @@ def run(
 
         # Print time (inference-only)
         LOGGER.info(f'{s}Done. ({t3 - t2:.3f}s)')
+    
+    json_path = save_dir / 'detections.json'
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(results_json, f, indent=4, ensure_ascii=False)
+    print(f'✓ JSON salvo em {json_path}')
 
     # Print results
     t = tuple(x / seen * 1E3 for x in dt)  # speeds per image

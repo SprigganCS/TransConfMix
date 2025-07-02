@@ -1,31 +1,36 @@
 # Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
 
+# train: # train images
+#   - /home/andre/ConfMix/Sim10K/images/train
 train: # train images
-  - /usr/src/datasets/Sim10K/images/train
+  - /home/andre/ConfMix/cyclegan_sim10k_cityscapes/images/train
 val: # val images
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/val/frankfurt
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/val/lindau
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/val/munster
+  # - /home/andre/ConfMix/Cityscapes/images/val/frankfurt
+  # - /home/andre/ConfMix/Cityscapes/images/val/lindau
+  # - /home/andre/ConfMix/Cityscapes/images/val/munster
+  - /home/andre/ConfMix/NuScenes/images/val
 test:  # test images (optional)
 uda: 
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/aachen
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/bochum
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/bremen
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/cologne
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/darmstadt
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/dusseldorf
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/erfurt
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/hamburg
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/hanover
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/jena
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/krefeld
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/monchengladbach
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/strasbourg
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/stuttgart
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/tubingen
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/ulm
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/weimar
-  - /usr/src/datasets/Cityscapes/adv_KITTI/images/train/zurich
+  - /home/andre/ConfMix/NuScenes/images/train
+
+  # - /home/andre/ConfMix/Cityscapes/images/train/aachen
+  # - /home/andre/ConfMix/Cityscapes/images/train/bochum
+  # - /home/andre/ConfMix/Cityscapes/images/train/bremen
+  # - /home/andre/ConfMix/Cityscapes/images/train/cologne
+  # - /home/andre/ConfMix/Cityscapes/images/train/darmstadt
+  # - /home/andre/ConfMix/Cityscapes/images/train/dusseldorf
+  # - /home/andre/ConfMix/Cityscapes/images/train/erfurt
+  # - /home/andre/ConfMix/Cityscapes/images/train/hamburg
+  # - /home/andre/ConfMix/Cityscapes/images/train/hanover
+  # - /home/andre/ConfMix/Cityscapes/images/train/jena
+  # - /home/andre/ConfMix/Cityscapes/images/train/krefeld
+  # - /home/andre/ConfMix/Cityscapes/images/train/monchengladbach
+  # - /home/andre/ConfMix/Cityscapes/images/train/strasbourg
+  # - /home/andre/ConfMix/Cityscapes/images/train/stuttgart
+  # - /home/andre/ConfMix/Cityscapes/images/train/tubingen
+  # - /home/andre/ConfMix/Cityscapes/images/train/ulm
+  # - /home/andre/ConfMix/Cityscapes/images/train/weimar
+  # - /home/andre/ConfMix/Cityscapes/images/train/zurich
 
 # Classes
 nc: 1 # number of classes
