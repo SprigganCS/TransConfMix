@@ -44,7 +44,7 @@ from models.yolo import Model
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
-from utils.dataloaders import create_dataloader, create_uda_dataloaders
+from utils.dataloaders import create_dataloader, create_uda_dataloaders, create_uda_three_domain_dataloaders
 from utils.downloads import attempt_download
 from utils.general import (LOGGER, check_dataset, check_file, check_git_status, check_img_size, check_requirements,
                            check_suffix, check_version, check_yaml, colorstr, get_latest_run, increment_path,
@@ -106,6 +106,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)  # check if None
     train_path, val_path, uda_path = data_dict['train'], data_dict['val'], data_dict['uda']
+    translated_path = data_dict.get('translated', None)  # novo domínio intermediário
     nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
     names = ['item'] if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
     assert len(names) == nc, f'{len(names)} names found for nc={nc} dataset in {data}'  # check
@@ -218,27 +219,53 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         LOGGER.info('Using SyncBatchNorm()')
 
     # Trainloader
-    print("Unsupervised Domain Adaptation training")
-    (train_loader_s, dataset_s, train_loader_t, dataset_t) = create_uda_dataloaders(
-        train_path,
-        uda_path,
-        imgsz,
-        batch_size // WORLD_SIZE,
-        gs,
-        single_cls,
-        hyp=hyp,
-        augment=True,
-        cache=None if opt.cache == 'val' else opt.cache,
-        rect=opt.rect,
-        rank=LOCAL_RANK,
-        workers=workers,
-        image_weights=opt.image_weights,
-        quad=opt.quad,
-        prefix=colorstr('train: '),
-        shuffle=True)
+    if translated_path:
+        print("Three-Domain Unsupervised Domain Adaptation training")
+        (train_loader_s, dataset_s, train_loader_translated, dataset_translated, 
+         train_loader_t, dataset_t) = create_uda_three_domain_dataloaders(
+            train_path,
+            translated_path,
+            uda_path,
+            imgsz,
+            batch_size // WORLD_SIZE,
+            gs,
+            single_cls,
+            hyp=hyp,
+            augment=True,
+            cache=None if opt.cache == 'val' else opt.cache,
+            rect=opt.rect,
+            rank=LOCAL_RANK,
+            workers=workers,
+            image_weights=opt.image_weights,
+            quad=opt.quad,
+            prefix=colorstr('train: '),
+            shuffle=True)
+    else:
+        print("Unsupervised Domain Adaptation training")
+        (train_loader_s, dataset_s, train_loader_t, dataset_t) = create_uda_dataloaders(
+            train_path,
+            uda_path,
+            imgsz,
+            batch_size // WORLD_SIZE,
+            gs,
+            single_cls,
+            hyp=hyp,
+            augment=True,
+            cache=None if opt.cache == 'val' else opt.cache,
+            rect=opt.rect,
+            rank=LOCAL_RANK,
+            workers=workers,
+            image_weights=opt.image_weights,
+            quad=opt.quad,
+            prefix=colorstr('train: '),
+            shuffle=True)
+        train_loader_translated, dataset_translated = None, None
 
     mlc = int(np.concatenate(dataset_s.labels, 0)[:, 0].max())  # max label class
-    nb = min(len(train_loader_s), len(train_loader_t))  # number of batches
+    if translated_path:
+        nb = min(len(train_loader_s), len(train_loader_translated), len(train_loader_t))  # number of batches
+    else:
+        nb = min(len(train_loader_s), len(train_loader_t))  # number of batches
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
 
     # Process 0
@@ -324,16 +351,33 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         mloss_confmix = torch.zeros(3, device=device)  # mean confmix losses
         if RANK != -1:
             train_loader_s.sampler.set_epoch(epoch)
+            if translated_path:
+                train_loader_translated.sampler.set_epoch(epoch)
             train_loader_t.sampler.set_epoch(epoch)
-        pbar = enumerate(zip(train_loader_s, train_loader_t))
+        
+        if translated_path:
+            pbar = enumerate(zip(train_loader_s, train_loader_translated, train_loader_t))
+        else:
+            pbar = enumerate(zip(train_loader_s, train_loader_t))
         LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
         optimizer.zero_grad()
-        for i, ((imgs_s, targets_s, paths_s, _), (imgs_t, _, paths_t, _)) in pbar:  # batch -------------------------------------------------------------
+        # Loop principal adaptado para 2 ou 3 domínios
+        for i, batch_data in pbar:  # batch -------------------------------------------------------------
             callbacks.run('on_train_batch_start')
             ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = torch.cat([imgs_s, imgs_t])
+            
+            # Descompactar dados dependendo do número de domínios
+            if translated_path:
+                (imgs_s, targets_s, paths_s, _), (imgs_translated, targets_translated, paths_translated, _), (imgs_t, _, paths_t, _) = batch_data
+                # Para 3 domínios: concatenar translated + target para confmix
+                imgs = torch.cat([imgs_translated, imgs_t])
+            else:
+                (imgs_s, targets_s, paths_s, _), (imgs_t, _, paths_t, _) = batch_data
+                # Para 2 domínios: concatenar source + target para confmix
+                imgs = torch.cat([imgs_s, imgs_t])
+            
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
 
             # Warmup
@@ -360,40 +404,65 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 r = ni / max_iterations
                 delta = 2 / (1 + math.exp(-5. * r)) - 1
                 
-                pred_s = model(
-                    imgs[: imgs_s.shape[0]], pseudo=True, delta=delta
-                )  # forward
+                if translated_path:
+                    # Para 3 domínios: imgs = [translated, target]
+                    # Primeiro fazer forward no source para loss supervisionado
+                    imgs_s = imgs_s.to(device, non_blocking=True).float() / 255
+                    pred_s_only = model(imgs_s, pseudo=True, delta=delta)
+                    pseudo_s_only, pred_s_only, var_s_only = pred_s_only
+                    
+                    # Depois fazer forward no translated para confmix
+                    pred_translated = model(
+                        imgs[:imgs_translated.shape[0]], pseudo=True, delta=delta
+                    )  # forward
+                    pseudo_translated, pred_translated, var_translated = pred_translated
 
-                # pseudo_s: pseudo detections on source images with the proposed confidence metric
-                # pred_s: predictions on source images
-                # var_s: variances on source images
-                pseudo_s, pred_s, var_s = pred_s
+                    # Forward no target para confmix
+                    pred_t = model(
+                        imgs[imgs_translated.shape[0]:], pseudo=True, delta=delta
+                    )  # forward
+                else:
+                    # Para 2 domínios: imgs = [source, target] - lógica original
+                    pred_s = model(
+                        imgs[: imgs_s.shape[0]], pseudo=True, delta=delta
+                    )  # forward
+                    pseudo_s, pred_s, var_s = pred_s
 
-                pred_t = model(
-                    imgs[imgs_s.shape[0]:], pseudo=True, delta=delta
-                )  # forward
+                    pred_t = model(
+                        imgs[imgs_s.shape[0]:], pseudo=True, delta=delta
+                    )  # forward
 
                 # pseudo_t: pseudo detections on target images with the proposed confidence metric
                 # pred_t: predictions on target images
                 # var_t: variances on target images
                 pseudo_t, pred_t, var_t = pred_t
 
-                # filter pseudo detections on source images applying NMS
-                out_s = non_max_suppression(pseudo_s.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
-                out_s = output_to_target(out_s)  # x,y,w,h
+                if translated_path:
+                    # Para 3 domínios: fazer confmix entre translated e target
+                    # filter pseudo detections on translated images applying NMS
+                    out_translated = non_max_suppression(pseudo_translated.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
+                    out_translated = output_to_target(out_translated)  # x,y,w,h
 
-                # filter pseudo detections on target images applying NMS
-                out = non_max_suppression(pseudo_t.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
-                # for i, det in enumerate(out):  # per image
-                #     det = det[det[:, 4].argsort(descending=True)]
-                #     max_det = int(len(det) * (max_det_pct/100))
-                #     det = det[:max_det]
-                #     out[i] = det
-                out = output_to_target(out)  # x,y,w,h
+                    # filter pseudo detections on target images applying NMS
+                    out = non_max_suppression(pseudo_t.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
+                    out = output_to_target(out)  # x,y,w,h
 
-                b, c, h, w = imgs_s.shape
-                out_s = torch.from_numpy(out_s) if out_s.size else torch.empty([0,7])
-                out = torch.from_numpy(out) if out.size else torch.empty([0,7])               
+                    b, c, h, w = imgs_translated.shape
+                    out_translated = torch.from_numpy(out_translated) if out_translated.size else torch.empty([0,7])
+                    out = torch.from_numpy(out) if out.size else torch.empty([0,7])
+                else:
+                    # Para 2 domínios: fazer confmix entre source e target (lógica original)
+                    # filter pseudo detections on source images applying NMS
+                    out_s = non_max_suppression(pseudo_s.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
+                    out_s = output_to_target(out_s)  # x,y,w,h
+
+                    # filter pseudo detections on target images applying NMS
+                    out = non_max_suppression(pseudo_t.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
+                    out = output_to_target(out)  # x,y,w,h
+
+                    b, c, h, w = imgs_s.shape
+                    out_s = torch.from_numpy(out_s) if out_s.size else torch.empty([0,7])
+                    out = torch.from_numpy(out) if out.size else torch.empty([0,7])               
 
                 # divide the pseudo detections on the target into 4 regions ([0,0] is top-left)
                 tar_lb = out[(out[:,2] < w//2) & (out[:,3] >= h//2), :]
@@ -407,50 +476,82 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 mean_confidences = torch.nan_to_num(torch.as_tensor([torch.mean(i[:,6]) for i in target_regions]))  # Column 6 includes the confidence of the predictions
                 index = torch.max(mean_confidences, 0)[1]
                 
-                # create binary mask for the confmix image and filter the source pseudo detections based on the selected region
+                # create binary mask for the confmix image and filter the pseudo detections based on the selected region
                 mask = torch.zeros((b, c, h, w))
                 if index == 0:
                     # tar_lb
                     tar_lb[:,2:6] = clip_coords_target(tar_lb, 0, w//2, h//2, h)
-                    out_s = out_s[(out_s[:,2] >= w//2) | (out_s[:,3] < h//2), :]
-                    out_s[(out_s[:,2] >= w//2) & (out_s[:,3] >= h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] >= w//2) & (out_s[:,3] >= h//2), :], w//2, w, 0, h)
-                    out_s[(out_s[:,2] >= w//2) & (out_s[:,3] < h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] >= w//2) & (out_s[:,3] < h//2), :], 0, w, 0, h)
-                    out_s[out_s[:,2] < w//2, 2:6] = clip_coords_target(out_s[out_s[:,2] < w//2, :], 0, w, 0, h//2)
+                    if translated_path:
+                        # Para 3 domínios: usar out_translated em vez de out_s
+                        out_translated = out_translated[(out_translated[:,2] >= w//2) | (out_translated[:,3] < h//2), :]
+                        out_translated[(out_translated[:,2] >= w//2) & (out_translated[:,3] >= h//2), 2:6] = clip_coords_target(out_translated[(out_translated[:,2] >= w//2) & (out_translated[:,3] >= h//2), :], w//2, w, 0, h)
+                        out_translated[(out_translated[:,2] >= w//2) & (out_translated[:,3] < h//2), 2:6] = clip_coords_target(out_translated[(out_translated[:,2] >= w//2) & (out_translated[:,3] < h//2), :], 0, w, 0, h)
+                        out_translated[out_translated[:,2] < w//2, 2:6] = clip_coords_target(out_translated[out_translated[:,2] < w//2, :], 0, w, 0, h//2)
+                    else:
+                        # Para 2 domínios: usar out_s (lógica original)
+                        out_s = out_s[(out_s[:,2] >= w//2) | (out_s[:,3] < h//2), :]
+                        out_s[(out_s[:,2] >= w//2) & (out_s[:,3] >= h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] >= w//2) & (out_s[:,3] >= h//2), :], w//2, w, 0, h)
+                        out_s[(out_s[:,2] >= w//2) & (out_s[:,3] < h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] >= w//2) & (out_s[:,3] < h//2), :], 0, w, 0, h)
+                        out_s[out_s[:,2] < w//2, 2:6] = clip_coords_target(out_s[out_s[:,2] < w//2, :], 0, w, 0, h//2)
 
                     mask[:, :, h//2:h+1, 0:w//2] = 1.
                 elif index == 1:
                     # tar_lt
                     tar_lt[:,2:6] = clip_coords_target(tar_lt, 0, w//2, 0, h//2)
-                    out_s = out_s[(out_s[:,2] >= w//2) | (out_s[:,3] >= h//2), :]
-                    out_s[(out_s[:,2] >= w//2) & (out_s[:,3] < h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] >= w//2) & (out_s[:,3] < h//2), :], w//2, w, 0, h)
-                    out_s[(out_s[:,2] >= w//2) & (out_s[:,3] >= h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] >= w//2) & (out_s[:,3] >= h//2), :], 0, w, 0, h)
-                    out_s[out_s[:,2] < w//2, 2:6] = clip_coords_target(out_s[out_s[:,2] < w//2, :], 0, w, h//2, h)
+                    if translated_path:
+                        out_translated = out_translated[(out_translated[:,2] >= w//2) | (out_translated[:,3] >= h//2), :]
+                        out_translated[(out_translated[:,2] >= w//2) & (out_translated[:,3] < h//2), 2:6] = clip_coords_target(out_translated[(out_translated[:,2] >= w//2) & (out_translated[:,3] < h//2), :], w//2, w, 0, h)
+                        out_translated[(out_translated[:,2] >= w//2) & (out_translated[:,3] >= h//2), 2:6] = clip_coords_target(out_translated[(out_translated[:,2] >= w//2) & (out_translated[:,3] >= h//2), :], 0, w, 0, h)
+                        out_translated[out_translated[:,2] < w//2, 2:6] = clip_coords_target(out_translated[out_translated[:,2] < w//2, :], 0, w, h//2, h)
+                    else:
+                        out_s = out_s[(out_s[:,2] >= w//2) | (out_s[:,3] >= h//2), :]
+                        out_s[(out_s[:,2] >= w//2) & (out_s[:,3] < h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] >= w//2) & (out_s[:,3] < h//2), :], w//2, w, 0, h)
+                        out_s[(out_s[:,2] >= w//2) & (out_s[:,3] >= h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] >= w//2) & (out_s[:,3] >= h//2), :], 0, w, 0, h)
+                        out_s[out_s[:,2] < w//2, 2:6] = clip_coords_target(out_s[out_s[:,2] < w//2, :], 0, w, h//2, h)
 
                     mask[:, :, 0:h//2, 0:w//2] = 1.
                 elif index == 2:
                     # tar_rb
                     tar_rb[:,2:6] = clip_coords_target(tar_rb, w//2, w, h//2, h)
-                    out_s = out_s[(out_s[:,2] < w//2) | (out_s[:,3] < h//2), :]
-                    out_s[(out_s[:,2] < w//2) & (out_s[:,3] >= h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] < w//2) & (out_s[:,3] >= h//2), :], w//2, w, 0, h)
-                    out_s[(out_s[:,2] < w//2) & (out_s[:,3] < h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] < w//2) & (out_s[:,3] < h//2), :], 0, w, 0, h)
-                    out_s[out_s[:,2] >= w//2, 2:6] = clip_coords_target(out_s[out_s[:,2] >= w//2, :], 0, w, 0, h//2)
+                    if translated_path:
+                        out_translated = out_translated[(out_translated[:,2] < w//2) | (out_translated[:,3] < h//2), :]
+                        out_translated[(out_translated[:,2] < w//2) & (out_translated[:,3] >= h//2), 2:6] = clip_coords_target(out_translated[(out_translated[:,2] < w//2) & (out_translated[:,3] >= h//2), :], w//2, w, 0, h)
+                        out_translated[(out_translated[:,2] < w//2) & (out_translated[:,3] < h//2), 2:6] = clip_coords_target(out_translated[(out_translated[:,2] < w//2) & (out_translated[:,3] < h//2), :], 0, w, 0, h)
+                        out_translated[out_translated[:,2] >= w//2, 2:6] = clip_coords_target(out_translated[out_translated[:,2] >= w//2, :], 0, w, 0, h//2)
+                    else:
+                        out_s = out_s[(out_s[:,2] < w//2) | (out_s[:,3] < h//2), :]
+                        out_s[(out_s[:,2] < w//2) & (out_s[:,3] >= h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] < w//2) & (out_s[:,3] >= h//2), :], w//2, w, 0, h)
+                        out_s[(out_s[:,2] < w//2) & (out_s[:,3] < h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] < w//2) & (out_s[:,3] < h//2), :], 0, w, 0, h)
+                        out_s[out_s[:,2] >= w//2, 2:6] = clip_coords_target(out_s[out_s[:,2] >= w//2, :], 0, w, 0, h//2)
 
                     mask[:, :, h//2:h+1, w//2:w+1] = 1.
                 elif index == 3:
                     # tar_rt
                     tar_rt[:,2:6] = clip_coords_target(tar_rt, w//2, w, 0, h//2)
-                    out_s = out_s[(out_s[:,2] < w//2) | (out_s[:,3] >= h//2), :]
-                    out_s[(out_s[:,2] < w//2) & (out_s[:,3] < h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] < w//2) & (out_s[:,3] < h//2), :], w//2, w, 0, h)
-                    out_s[(out_s[:,2] < w//2) & (out_s[:,3] >= h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] < w//2) & (out_s[:,3] >= h//2), :], 0, w, 0, h)
-                    out_s[out_s[:,2] >= w//2, 2:6] = clip_coords_target(out_s[out_s[:,2] >= w//2, :], 0, w, h//2, h)
+                    if translated_path:
+                        out_translated = out_translated[(out_translated[:,2] < w//2) | (out_translated[:,3] >= h//2), :]
+                        out_translated[(out_translated[:,2] < w//2) & (out_translated[:,3] < h//2), 2:6] = clip_coords_target(out_translated[(out_translated[:,2] < w//2) & (out_translated[:,3] < h//2), :], w//2, w, 0, h)
+                        out_translated[(out_translated[:,2] < w//2) & (out_translated[:,3] >= h//2), 2:6] = clip_coords_target(out_translated[(out_translated[:,2] < w//2) & (out_translated[:,3] >= h//2), :], 0, w, 0, h)
+                        out_translated[out_translated[:,2] >= w//2, 2:6] = clip_coords_target(out_translated[out_translated[:,2] >= w//2, :], 0, w, h//2, h)
+                    else:
+                        out_s = out_s[(out_s[:,2] < w//2) | (out_s[:,3] >= h//2), :]
+                        out_s[(out_s[:,2] < w//2) & (out_s[:,3] < h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] < w//2) & (out_s[:,3] < h//2), :], w//2, w, 0, h)
+                        out_s[(out_s[:,2] < w//2) & (out_s[:,3] >= h//2), 2:6] = clip_coords_target(out_s[(out_s[:,2] < w//2) & (out_s[:,3] >= h//2), :], 0, w, 0, h)
+                        out_s[out_s[:,2] >= w//2, 2:6] = clip_coords_target(out_s[out_s[:,2] >= w//2, :], 0, w, h//2, h)
 
                     mask[:, :, 0:h//2, w//2:w+1] = 1.
 
                 # create confmix targets and compute confmix weight
-                targets_confmix_s = out_s
-                targets_confmix_t = target_regions[index]
-
-                targets_confmix = torch.cat((targets_confmix_s, targets_confmix_t))
+                if translated_path:
+                    # Para 3 domínios: confmix entre translated e target
+                    targets_confmix_translated = out_translated
+                    targets_confmix_t = target_regions[index]
+                    targets_confmix = torch.cat((targets_confmix_translated, targets_confmix_t))
+                else:
+                    # Para 2 domínios: confmix entre source e target (lógica original)
+                    targets_confmix_s = out_s
+                    targets_confmix_t = target_regions[index]
+                    targets_confmix = torch.cat((targets_confmix_s, targets_confmix_t))
 
                 c_gamma_thres = 0.5
                 gamma = (targets_confmix[:,6] > c_gamma_thres).sum() / \
@@ -462,7 +563,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 targets_confmix[:, [3, 5]] /= h
 
                 # create confmix image
-                imgs_confmix = imgs_s*(1-mask) + imgs_t*mask
+                if translated_path:
+                    # Para 3 domínios: confmix entre translated e target
+                    imgs_confmix = imgs_translated*(1-mask) + imgs_t*mask
+                else:
+                    # Para 2 domínios: confmix entre source e target
+                    imgs_confmix = imgs_s*(1-mask) + imgs_t*mask
                 imgs_confmix = imgs_confmix.to(device, non_blocking=True).float() / 255.0
 
                 pred_confmix = model(
@@ -473,22 +579,51 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 # var_confmix: variances on confmix images
                 _, pred_confmix, var_confmix = pred_confmix
                 
-                # supervised detector loss term on the labelled source samples
-                loss, loss_items = compute_loss(
-                    pred_s, targets_s.to(device), var_s
-                )
-
-                # self-supervised consistency loss term on the mixed samples
-                loss_confmix, loss_items_confmix = compute_loss(
-                    pred_confmix, targets_confmix.to(device), var_confmix
-                )
-
-                if RANK != -1:
-                    loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
-                if opt.quad:
-                    loss *= 4.
+                if translated_path:
+                    # Para 3 domínios: loss supervisionado para source + translated, confmix entre translated+target
+                    # Loss supervisionado no source
+                    loss_source, loss_items_source = compute_loss(
+                        pred_s_only, targets_s.to(device), var_s_only
+                    )
                     
-                total_loss = loss + loss_confmix * torch.nan_to_num(gamma)
+                    # Loss supervisionado no translated (tem labels)
+                    loss_translated, loss_items_translated = compute_loss(
+                        pred_translated, targets_translated.to(device), var_translated
+                    )
+                    
+                    # Loss consistency no confmix (translated + target)
+                    loss_confmix, loss_items_confmix = compute_loss(
+                        pred_confmix, targets_confmix.to(device), var_confmix
+                    )
+                    
+                    # Combinar losses: supervisionado (source + translated) + consistency (confmix)
+                    loss = loss_source + loss_translated
+                    loss_items = (loss_items_source + loss_items_translated) / 2  # média dos loss items
+                    
+                    if RANK != -1:
+                        loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+                    if opt.quad:
+                        loss *= 4.
+                        
+                    total_loss = loss + loss_confmix * torch.nan_to_num(gamma)
+                else:
+                    # Para 2 domínios: lógica original
+                    # supervised detector loss term on the labelled source samples
+                    loss, loss_items = compute_loss(
+                        pred_s, targets_s.to(device), var_s
+                    )
+
+                    # self-supervised consistency loss term on the mixed samples
+                    loss_confmix, loss_items_confmix = compute_loss(
+                        pred_confmix, targets_confmix.to(device), var_confmix
+                    )
+
+                    if RANK != -1:
+                        loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+                    if opt.quad:
+                        loss *= 4.
+                        
+                    total_loss = loss + loss_confmix * torch.nan_to_num(gamma)
 
             # Backward
             scaler.scale(total_loss).backward()
@@ -504,26 +639,51 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 
             # Plot
             if i == 0 and epoch < 10:
-                f = save_dir / f'train_batch{epoch}.jpg'  # filename
-                plot_images(imgs_s, targets_s, paths_s, f)
+                if translated_path:
+                    # Para 3 domínios: plotar source, translated, target e confmix
+                    f = save_dir / f'train_batch_source{epoch}.jpg'  # filename
+                    plot_images(imgs_s, targets_s, paths_s, f)
+                    
+                    f = save_dir / f'train_batch_translated{epoch}.jpg'  # filename
+                    plot_images(imgs_translated, targets_translated, paths_translated, f)
 
-                f = save_dir / f'train_pred_s{epoch}.jpg'  # filename
-                plot_images(imgs_s, out_s, paths_s, f)
-                
-                f = save_dir / f'train_pred_t{epoch}.jpg'  # filename
-                plot_images(imgs_t, out, paths_t, f)
+                    f = save_dir / f'train_pred_translated{epoch}.jpg'  # filename
+                    plot_images(imgs_translated, out_translated, paths_translated, f)
+                    
+                    f = save_dir / f'train_pred_t{epoch}.jpg'  # filename
+                    plot_images(imgs_t, out, paths_t, f)
 
-                f = save_dir / f'train_confmix{epoch}.jpg'  # filename
-                plot_images(imgs_confmix, targets_confmix, "", f)
+                    f = save_dir / f'train_confmix{epoch}.jpg'  # filename
+                    plot_images(imgs_confmix, targets_confmix, "", f)
+                else:
+                    # Para 2 domínios: plotar source, target e confmix (lógica original)
+                    f = save_dir / f'train_batch{epoch}.jpg'  # filename
+                    plot_images(imgs_s, targets_s, paths_s, f)
+
+                    f = save_dir / f'train_pred_s{epoch}.jpg'  # filename
+                    plot_images(imgs_s, out_s, paths_s, f)
+                    
+                    f = save_dir / f'train_pred_t{epoch}.jpg'  # filename
+                    plot_images(imgs_t, out, paths_t, f)
+
+                    f = save_dir / f'train_confmix{epoch}.jpg'  # filename
+                    plot_images(imgs_confmix, targets_confmix, "", f)
 
             # Log
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mloss_confmix = (mloss_confmix * i + loss_items_confmix) / (i + 1)  # update mean losses
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                pbar.set_description(('%10s' * 2 + '%10.4g' * 5) %
-                                     (f'{epoch}/{epochs - 1}', mem, *mloss, targets_s.shape[0], imgs.shape[-1]))
-                callbacks.run('on_train_batch_end', ni, model, imgs[: imgs_s.shape[0]], targets_s, paths_s, plots)
+                if translated_path:
+                    # Para 3 domínios: usar targets_s para logging
+                    pbar.set_description(('%10s' * 2 + '%10.4g' * 5) %
+                                         (f'{epoch}/{epochs - 1}', mem, *mloss, targets_s.shape[0], imgs_s.shape[-1]))
+                    callbacks.run('on_train_batch_end', ni, model, imgs_s, targets_s, paths_s, plots)
+                else:
+                    # Para 2 domínios: lógica original
+                    pbar.set_description(('%10s' * 2 + '%10.4g' * 5) %
+                                         (f'{epoch}/{epochs - 1}', mem, *mloss, targets_s.shape[0], imgs.shape[-1]))
+                    callbacks.run('on_train_batch_end', ni, model, imgs[: imgs_s.shape[0]], targets_s, paths_s, plots)
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
