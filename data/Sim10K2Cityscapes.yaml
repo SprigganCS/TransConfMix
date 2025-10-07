@@ -3,15 +3,17 @@
 # train: # train images
 #   - /home/andre/ConfMix/Sim10K/images/train
 train: # train images
-  - /home/andre/datasets/dolphins_vehicle/images/train
+  #- /home/andre/datasets/dolphins_vehicle/images/train
+  - /home/andre/ConfMix/Sim10K/images/train
 val: # val images
-  - /home/andre/ConfMix/Cityscapes/images/val/frankfurt
-  - /home/andre/ConfMix/Cityscapes/images/val/lindau
-  - /home/andre/ConfMix/Cityscapes/images/val/munster
-  # - /home/andre/ConfMix/NuScenes/images/val
+  # - /home/andre/ConfMix/Cityscapes/images/val/frankfurt
+  # - /home/andre/ConfMix/Cityscapes/images/val/lindau
+  # - /home/andre/ConfMix/Cityscapes/images/val/munster
+  #- /home/andre/ConfMix/NuScenes/images/val
+  - /home/andre/ConfMix/Cityscapes/images/val/all_val
 test:  # test images (optional)
 uda: 
-  # - /home/andre/ConfMix/NuScenes/images/train
+  #- /home/andre/ConfMix/NuScenes/images/train
 
   - /home/andre/ConfMix/Cityscapes/images/train/aachen
   - /home/andre/ConfMix/Cityscapes/images/train/bochum
@@ -33,8 +35,8 @@ uda:
   - /home/andre/ConfMix/Cityscapes/images/train/zurich
 
 translated:  # 🔹 novo bloco com imagens traduzidas (COM labels, mesmas do source)
-  - /home/andre/ConfMix/dolphins_vehicle_maskedGan100_cityscapesstyle/images/train
-
+  # - /home/andre/ConfMix/dolphins_vehicle_maskedGan100_cityscapesstyle/images/train
+   - /home/andre/ConfMix/cyclegan_sim10k_cityscapes/images/train
 # Classes
 nc: 1 # number of classes
 names: ['car'] # class names

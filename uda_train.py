@@ -439,7 +439,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
                 if translated_path:
                     # Para 3 domínios: fazer confmix entre translated e target
-                    # filter pseudo detections on translated images applying NMS
+                    # CORREÇÃO: Gerar detecções do source original (Xs) conforme orientador
+                    out_s = non_max_suppression(pseudo_s_only.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
+                    out_s = output_to_target(out_s)  # x,y,w,h
+                    
+                    # filter pseudo detections on translated images applying NMS (para outras funções)
                     out_translated = non_max_suppression(pseudo_translated.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
                     out_translated = output_to_target(out_translated)  # x,y,w,h
 
@@ -447,7 +451,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     out = non_max_suppression(pseudo_t.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
                     out = output_to_target(out)  # x,y,w,h
 
-                    b, c, h, w = imgs_translated.shape
+                    b, c, h, w = imgs_s.shape  # Usar dimensões do source original para máscaras
+                    out_s = torch.from_numpy(out_s) if out_s.size else torch.empty([0,7])
                     out_translated = torch.from_numpy(out_translated) if out_translated.size else torch.empty([0,7])
                     out = torch.from_numpy(out) if out.size else torch.empty([0,7])
                 else:
@@ -543,10 +548,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
                 # create confmix targets and compute confmix weight
                 if translated_path:
-                    # Para 3 domínios: confmix entre translated e target
-                    targets_confmix_translated = out_translated
-                    targets_confmix_t = target_regions[index]
-                    targets_confmix = torch.cat((targets_confmix_translated, targets_confmix_t))
+                    # Para 3 domínios: CORREÇÃO - usar detecções do source original (Xs) conforme orientador
+                    targets_confmix_s = out_s  # Detecções do source original (Xs)
+                    targets_confmix_t = target_regions[index]  # Detecções do target (Xt)
+                    targets_confmix = torch.cat((targets_confmix_s, targets_confmix_t))
                 else:
                     # Para 2 domínios: confmix entre source e target (lógica original)
                     targets_confmix_s = out_s
