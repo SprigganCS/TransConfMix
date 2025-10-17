@@ -48,6 +48,8 @@ cyclegan_sim10k_cityscapes/
 dolphins_vehicle_maskedGan100_cityscapesstyle/
 dolphins_vehicle_translated_official_cycle200/
 dolphins_vehicle_unmask_translated_nusc/
+dolphins_vehicle_unmask_translated_city/
+sim10k2nuscenes_900-CYCLEGAN/
 last_checkpoint/
 NuScenes/
 Sim10K/
