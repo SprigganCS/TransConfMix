@@ -44,7 +44,7 @@ from models.yolo import Model
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
-from utils.dataloaders import create_dataloader, create_uda_dataloaders
+from utils.dataloaders import create_dataloader, create_uda_dataloaders, create_uda_dataloaders_distill
 from utils.downloads import attempt_download
 from utils.general import (LOGGER, check_dataset, check_file, check_git_status, check_img_size, check_requirements,
                            check_suffix, check_version, check_yaml, colorstr, get_latest_run, increment_path,
@@ -106,10 +106,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)  # check if None
     train_path, val_path, uda_path = data_dict['train'], data_dict['val'], data_dict['uda']
+    train_translated_path = data_dict.get('train_translated')
     nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
     names = ['item'] if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
     assert len(names) == nc, f'{len(names)} names found for nc={nc} dataset in {data}'  # check
     is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
+    if opt.use_distill:
+        assert train_translated_path, f'Missing train_translated in {data}'
 
     # Model
     check_suffix(weights, '.pt')  # check weights
@@ -217,28 +220,60 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         LOGGER.info('Using SyncBatchNorm()')
 
+    # Teacher (distillation)
+    teacher = None
+    if opt.use_distill:
+        assert opt.teacher_weights, '--teacher_weights is required when --use_distill'
+        check_suffix(opt.teacher_weights, '.pt')
+        teacher = attempt_load(opt.teacher_weights, device)
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+
     # Trainloader
     print("Unsupervised Domain Adaptation training")
-    (train_loader_s, dataset_s, train_loader_t, dataset_t) = create_uda_dataloaders(
-        train_path,
-        uda_path,
-        imgsz,
-        batch_size // WORLD_SIZE,
-        gs,
-        single_cls,
-        hyp=hyp,
-        augment=True,
-        cache=None if opt.cache == 'val' else opt.cache,
-        rect=opt.rect,
-        rank=LOCAL_RANK,
-        workers=workers,
-        image_weights=opt.image_weights,
-        quad=opt.quad,
-        prefix=colorstr('train: '),
-        shuffle=True)
+    if opt.use_distill:
+        (train_loader_s, dataset_s, train_loader_sp, dataset_sp, train_loader_t, dataset_t) = create_uda_dataloaders_distill(
+            train_path,
+            train_translated_path,
+            uda_path,
+            imgsz,
+            batch_size // WORLD_SIZE,
+            gs,
+            single_cls,
+            hyp=hyp,
+            augment=True,
+            cache=None if opt.cache == 'val' else opt.cache,
+            rect=opt.rect,
+            rank=LOCAL_RANK,
+            workers=workers,
+            image_weights=opt.image_weights,
+            quad=opt.quad,
+            prefix=colorstr('train: '),
+            shuffle=True)
+    else:
+        (train_loader_s, dataset_s, train_loader_t, dataset_t) = create_uda_dataloaders(
+            train_path,
+            uda_path,
+            imgsz,
+            batch_size // WORLD_SIZE,
+            gs,
+            single_cls,
+            hyp=hyp,
+            augment=True,
+            cache=None if opt.cache == 'val' else opt.cache,
+            rect=opt.rect,
+            rank=LOCAL_RANK,
+            workers=workers,
+            image_weights=opt.image_weights,
+            quad=opt.quad,
+            prefix=colorstr('train: '),
+            shuffle=True)
 
     mlc = int(np.concatenate(dataset_s.labels, 0)[:, 0].max())  # max label class
     nb = min(len(train_loader_s), len(train_loader_t))  # number of batches
+    if opt.use_distill:
+        nb = min(nb, len(train_loader_sp))
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
 
     # Process 0
@@ -325,13 +360,22 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if RANK != -1:
             train_loader_s.sampler.set_epoch(epoch)
             train_loader_t.sampler.set_epoch(epoch)
-        pbar = enumerate(zip(train_loader_s, train_loader_t))
+            if opt.use_distill:
+                train_loader_sp.sampler.set_epoch(epoch)
+        if opt.use_distill:
+            pbar = enumerate(zip(train_loader_s, train_loader_sp, train_loader_t))
+        else:
+            pbar = enumerate(zip(train_loader_s, train_loader_t))
         LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
         optimizer.zero_grad()
-        for i, ((imgs_s, targets_s, paths_s, _), (imgs_t, _, paths_t, _)) in pbar:  # batch -------------------------------------------------------------
+        for i, batch in pbar:  # batch -------------------------------------------------------------
             callbacks.run('on_train_batch_start')
+            if opt.use_distill:
+                (imgs_s, targets_s, paths_s, _), (imgs_sp, _, paths_sp, _), (imgs_t, _, paths_t, _) = batch
+            else:
+                (imgs_s, targets_s, paths_s, _), (imgs_t, _, paths_t, _) = batch
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = torch.cat([imgs_s, imgs_t])
             imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
@@ -359,7 +403,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             with amp.autocast(enabled=cuda):
                 r = ni / max_iterations
                 delta = 2 / (1 + math.exp(-5. * r)) - 1
-                
+
+                if opt.use_distill:
+                    imgs_sp = imgs_sp.to(device, non_blocking=True).float() / 255
+
                 pred_s = model(
                     imgs[: imgs_s.shape[0]], pseudo=True, delta=delta
                 )  # forward
@@ -377,6 +424,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 # pred_t: predictions on target images
                 # var_t: variances on target images
                 pseudo_t, pred_t, var_t = pred_t
+
+                if opt.use_distill:
+                    pred_sp = model(
+                        imgs_sp, pseudo=True, delta=delta
+                    )  # forward
+                    # pred_sp: predictions on translated source images
+                    # var_sp: variances on translated source images
+                    _, pred_sp, var_sp = pred_sp
 
                 # filter pseudo detections on source images applying NMS
                 out_s = non_max_suppression(pseudo_s.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
@@ -478,6 +533,30 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     pred_s, targets_s.to(device), var_s
                 )
 
+                # distillation loss term on translated source samples (S')
+                loss_distill = torch.zeros(1, device=device)
+                loss_items_distill = torch.zeros(3, device=device)
+                if opt.use_distill:
+                    with torch.no_grad():
+                        teacher_out = teacher(imgs_sp, pseudo=True, delta=delta)
+                        pseudo_sp, _, _ = teacher_out
+                        out_sp = non_max_suppression(
+                            pseudo_sp.detach(),
+                            conf_thres=opt.distill_conf_thres,
+                            iou_thres=0.5,
+                            multi_label=False)
+                        out_sp = output_to_target(out_sp)  # x,y,w,h
+
+                    out_sp = torch.from_numpy(out_sp) if out_sp.size else torch.empty([0, 7])
+                    if out_sp.numel():
+                        _, _, h_sp, w_sp = imgs_sp.shape
+                        out_sp[:, [2, 4]] /= w_sp
+                        out_sp[:, [3, 5]] /= h_sp
+                        targets_distill = out_sp[:, :6]
+                        loss_distill, loss_items_distill = compute_loss(
+                            pred_sp, targets_distill.to(device), var_sp
+                        )
+
                 # self-supervised consistency loss term on the mixed samples
                 loss_confmix, loss_items_confmix = compute_loss(
                     pred_confmix, targets_confmix.to(device), var_confmix
@@ -485,10 +564,15 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+                    loss_distill *= WORLD_SIZE
                 if opt.quad:
                     loss *= 4.
-                    
-                total_loss = loss + loss_confmix * torch.nan_to_num(gamma)
+                    loss_distill *= 4.
+
+                if opt.use_distill:
+                    total_loss = loss + opt.lambda_distill * loss_distill + loss_confmix * torch.nan_to_num(gamma)
+                else:
+                    total_loss = loss + loss_confmix * torch.nan_to_num(gamma)
 
             # Backward
             scaler.scale(total_loss).backward()
@@ -659,6 +743,10 @@ def parse_opt(known=False):
     parser.add_argument('--save-period', type=int, default=-1, help='Save checkpoint every x epochs (disabled if < 1)')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--max-det-pct', type=int, default=100, help='maximum percentage of pseudo-detection before mixing')
+    parser.add_argument('--use_distill', action='store_true', help='enable teacher-student distillation on S\'')
+    parser.add_argument('--lambda_distill', type=float, default=0.5, help='distillation loss weight')
+    parser.add_argument('--teacher_weights', type=str, default='', help='teacher weights path (trained on S only)')
+    parser.add_argument('--distill_conf_thres', type=float, default=0.5, help='distill pseudo-label conf threshold')
 
     # Weights & Biases arguments
     parser.add_argument('--entity', default=None, help='W&B: Entity')
@@ -689,6 +777,8 @@ def main(opt, callbacks=Callbacks()):
         opt.data, opt.cfg, opt.hyp, opt.weights, opt.project = \
             check_file(opt.data), check_yaml(opt.cfg), check_yaml(opt.hyp), str(opt.weights), str(opt.project)  # checks
         assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
+        if opt.use_distill:
+            opt.teacher_weights = check_file(opt.teacher_weights)
         if opt.evolve:
             if opt.project == str(ROOT / 'runs/train'):  # if default project name, rename to runs/evolve
                 opt.project = str(ROOT / 'runs/evolve')

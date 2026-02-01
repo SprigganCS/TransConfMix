@@ -1,0 +1,19 @@
+tmux attach -t confmix
+
+*ativar conda
+conda env list
+conda activate ConfMix
+
+
+python train.py \
+ --name cityscapes \
+ --batch 2 \
+ --img 600 \
+ --epochs 50 \
+ --data data/Sim10K2Cityscapes.yaml \
+ --weights yolov5s.pt
+
+ 
+python uda_train.py  --name {NAME}  --batch 2  --img 600  --epochs 50  --data data/Sim10K2Cityscapes.yaml  --weights {model.pt}
+
+python detect.py --weights {model.pt}  --source {path/to/val_images} --name {name}

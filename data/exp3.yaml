@@ -1,18 +1,15 @@
 # Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
 
 train: # train images
-  - /home/andre/datasets/samples/sim10k/images/train
-train_translated: # translated source images (CycleGAN S->T)
-  - /home/andre/datasets/samples/TRANSLATED/sample_masked_sim10k2cityscapes_512/images/train
+  - /home/andre/datasets/samples/TRANSLATED/exps/exp3/images/train
+ 
+
 val: # val images
-  # - /home/andre/ConfMix/Cityscapes/images/val/frankfurt
-  # - /home/andre/ConfMix/Cityscapes/images/val/lindau
-  # - /home/andre/ConfMix/Cityscapes/images/val/munster
-  # - /home/andre/ConfMix/NuScenes/images/val
   - /home/andre/datasets/originals/Cityscapes/images/val/all_val
+ 
 test:  # test images (optional)
-uda: 
-  # - /home/andre/ConfMix/NuScenes/images/train
+uda:
+  # - /home/andre/datasets/samples/nuscenes/images/train
 
   - /home/andre/datasets/samples/cityscapes/images/train/aachen
   - /home/andre/datasets/samples/cityscapes/images/train/bochum
@@ -37,4 +34,4 @@ uda:
 nc: 1 # number of classes
 names: ['car'] # class names
 # Download script/URL (optional)
-download:
+download: 

@@ -1,0 +1,20 @@
+# Template UDA (source + target + translated)
+# Preencha com os caminhos reais no seu ambiente
+
+train:  # source (com rótulos)
+  - /path/to/source/images/train
+
+translated:  # source_translated (com rótulos, mesmo schema do source)
+  - /path/to/source_translated/images/train
+
+uda:  # target (sem rótulos, usado para pseudo/ConfMix)
+  - /path/to/target/images/train
+
+val:  # validação (target ou outro domínio)
+  - /path/to/val/images
+
+test:  # opcional
+
+# Classes
+nc: 1
+names: ['car']

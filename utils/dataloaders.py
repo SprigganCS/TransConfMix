@@ -211,6 +211,101 @@ def create_uda_dataloaders(path_s,
     return dataloader_s, dataset_s, dataloader_t, dataset_t
 
 
+def create_uda_dataloaders_distill(path_s,
+                              path_sp,
+                              path_t,
+                              imgsz,
+                              batch_size,
+                              stride,
+                              single_cls=False,
+                              hyp=None,
+                              augment=False,
+                              cache=False,
+                              pad=0.0,
+                              rect=False,
+                              rank=-1,
+                              workers=8,
+                              image_weights=False,
+                              quad=False,
+                              prefix='',
+                              shuffle=False):
+    half_batch = batch_size // 2
+    if rect and shuffle:
+        LOGGER.warning('WARNING: --rect is incompatible with DataLoader shuffle, setting shuffle=False')
+        shuffle = False
+    with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
+        dataset_s = LoadImagesAndLabels(
+            path_s,
+            imgsz,
+            half_batch,
+            augment=augment,  # augmentation
+            hyp=hyp,  # hyperparameters
+            rect=rect,  # rectangular batches
+            cache_images=cache,
+            single_cls=single_cls,
+            stride=int(stride),
+            pad=pad,
+            image_weights=image_weights,
+            prefix=prefix)
+
+        dataset_sp = LoadImagesAndLabels(
+            path_sp,
+            imgsz,
+            half_batch,
+            augment=augment,  # augmentation
+            hyp=hyp,  # hyperparameters
+            rect=rect,  # rectangular batches
+            cache_images=cache,
+            single_cls=single_cls,
+            stride=int(stride),
+            pad=pad,
+            image_weights=image_weights,
+            prefix=colorstr('train_translated: '))
+
+        dataset_t = LoadImagesAndLabels(
+            path_t,
+            imgsz,
+            half_batch,
+            augment=augment,  # augmentation
+            hyp=hyp,  # hyperparameters
+            rect=rect,  # rectangular batches
+            cache_images=cache,
+            single_cls=single_cls,
+            stride=int(stride),
+            pad=pad,
+            image_weights=image_weights,
+            prefix=colorstr('uda: '))
+
+    nd = torch.cuda.device_count()  # number of CUDA devices
+    nw = min([os.cpu_count() // max(nd, 1), batch_size if batch_size > 1 else 0, workers])  # number of workers
+    sampler_s = None if rank == -1 else distributed.DistributedSampler(dataset_s, shuffle=shuffle)
+    sampler_sp = None if rank == -1 else distributed.DistributedSampler(dataset_sp, shuffle=shuffle)
+    sampler_t = None if rank == -1 else distributed.DistributedSampler(dataset_t, shuffle=shuffle)
+    loader = DataLoader if image_weights else InfiniteDataLoader  # only DataLoader allows for attribute updates
+    dataloader_s = loader(dataset_s,
+                        batch_size=half_batch,
+                        shuffle=shuffle and sampler_s is None,
+                        num_workers=nw,
+                        sampler=sampler_s,
+                        pin_memory=True,
+                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
+    dataloader_sp = loader(dataset_sp,
+                        batch_size=half_batch,
+                        shuffle=shuffle and sampler_sp is None,
+                        num_workers=nw,
+                        sampler=sampler_sp,
+                        pin_memory=True,
+                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
+    dataloader_t = loader(dataset_t,
+                        batch_size=half_batch,
+                        shuffle=shuffle and sampler_t is None,
+                        num_workers=nw,
+                        sampler=sampler_t,
+                        pin_memory=True,
+                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
+    return dataloader_s, dataset_s, dataloader_sp, dataset_sp, dataloader_t, dataset_t
+
+
 class InfiniteDataLoader(dataloader.DataLoader):
     """ Dataloader that reuses workers
 
