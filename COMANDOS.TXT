@@ -17,3 +17,7 @@ python train.py \
 python uda_train.py  --name {NAME}  --batch 2  --img 600  --epochs 50  --data data/Sim10K2Cityscapes.yaml  --weights {model.pt}
 
 python detect.py --weights {model.pt}  --source {path/to/val_images} --name {name}
+
+
+comando da branch kl-loss
+python uda_train.py   --data data/Sim10K2Cityscapes.yaml   --weights /home/andre/ConfMix/runs/train/SAMPLE_MODELS/sim10k_sample/weights/last.pt   --teacher_weights /home/andre/ConfMix/runs/train/SAMPLE_MODELS/sim10k_sample/weights/last.pt   --use_distill   --lambda_kl 0.5   --epochs 50   --batch-size 2   --img 600   --workers 4   --name confmix_klobj_mixSprime_lk0p1_lambda0.5
