@@ -364,6 +364,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         kl_batches = 0
         kl_nonfinite_steps = 0
         kl_clamp_hits = 0
+        kl_mask_active_running = 0.0
+        kl_mask_batches = 0
         pT_min_epoch, pT_max_epoch = 1.0, 0.0
         pS_min_epoch, pS_max_epoch = 1.0, 0.0
         if RANK != -1:
@@ -571,6 +573,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
                     eps = 1e-4  # larger eps to avoid saturation under AMP/FP16
                     kl_total = 0.0
+                    kl_mask_active = 0.0
                     with amp.autocast(enabled=False):
                         for pt, ps in zip(pred_teacher, pred_sp):
                             p_t_raw = torch.sigmoid(pt[..., 4].float()).detach()
@@ -582,10 +585,22 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                             pS_max_epoch = max(pS_max_epoch, float(p_s_raw.max()))
                             p_t = p_t_raw.clamp(eps, 1 - eps)
                             p_s = p_s_raw.clamp(eps, 1 - eps)
-                            kl = p_t * torch.log(p_t / p_s)
-                            kl += (1 - p_t) * torch.log((1 - p_t) / (1 - p_s))
-                            kl_total += kl.mean()
+                            kl_map = p_t * torch.log(p_t / p_s)
+                            kl_map += (1 - p_t) * torch.log((1 - p_t) / (1 - p_s))
+                            if opt.kl_mask_mode == 'hard':
+                                m = (p_t > opt.kl_tau).float()
+                                kl_total += (kl_map * m).sum() / (m.sum() + 1e-6)
+                                kl_mask_active += float((m > 0).float().mean())
+                            elif opt.kl_mask_mode == 'soft':
+                                m = p_t ** opt.kl_mask_power
+                                kl_total += (kl_map * m).sum() / (m.sum() + 1e-6)
+                                kl_mask_active += float(m.mean())
+                            else:
+                                kl_total += kl_map.mean()
                     loss_kl = kl_total / max(len(pred_teacher), 1)
+                    if opt.kl_mask_mode in {'hard', 'soft'}:
+                        kl_mask_active_running += kl_mask_active / max(len(pred_teacher), 1)
+                        kl_mask_batches += 1
                     if not torch.isfinite(loss_kl).all():
                         kl_nonfinite_steps += 1
                         if RANK in {-1, 0}:
@@ -671,6 +686,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     f"KL: mean={kl_mean_epoch:.4g} nonfinite_steps={kl_nonfinite_steps} clamp_hits={kl_clamp_hits} "
                     f"pT=[{pT_min_epoch:.4g},{pT_max_epoch:.4g}] pS=[{pS_min_epoch:.4g},{pS_max_epoch:.4g}]"
                 )
+                if opt.kl_mask_mode in {'hard', 'soft'}:
+                    active_ratio = kl_mask_active_running / max(kl_mask_batches, 1)
+                    LOGGER.info(
+                        f"KLmask: mode={opt.kl_mask_mode} tau={opt.kl_tau} active={active_ratio:.4g}"
+                    )
                 if opt.debug_kl and kl_nonfinite_steps > 0:
                     raise RuntimeError('Non-finite L_kl detected with --debug_kl')
             # mAP
@@ -805,6 +825,10 @@ def parse_opt(known=False):
     parser.add_argument('--teacher_weights', type=str, default='', help='teacher weights path (trained on S only)')
     parser.add_argument('--distill_conf_thres', type=float, default=0.5, help='deprecated (unused)')
     parser.add_argument('--debug_kl', action='store_true', help='debug KL stability (asserts on non-finite)')
+    parser.add_argument('--kl_mask_mode', type=str, default='hard', choices=['hard', 'soft', 'none'],
+                        help='mask mode for objectness KL (hard, soft, none)')
+    parser.add_argument('--kl_tau', type=float, default=0.01, help='threshold for hard KL mask')
+    parser.add_argument('--kl_mask_power', type=float, default=1.0, help='power for soft KL mask')
 
     # Weights & Biases arguments
     parser.add_argument('--entity', default=None, help='W&B: Entity')
