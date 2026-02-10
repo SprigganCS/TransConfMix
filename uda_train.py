@@ -233,7 +233,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     # Trainloader
     print("Unsupervised Domain Adaptation training")
     if opt.use_distill:
-        (train_loader_s, dataset_s, train_loader_sp, dataset_sp, train_loader_t, dataset_t) = create_uda_dataloaders_distill(
+        (train_loader_s, dataset_s, train_loader_t, dataset_t) = create_uda_dataloaders_distill(
             train_path,
             train_translated_path,
             uda_path,
@@ -272,8 +272,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
     mlc = int(np.concatenate(dataset_s.labels, 0)[:, 0].max())  # max label class
     nb = min(len(train_loader_s), len(train_loader_t))  # number of batches
-    if opt.use_distill:
-        nb = min(nb, len(train_loader_sp))
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
 
     # Process 0
@@ -336,6 +334,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     stopper = EarlyStopping(patience=opt.patience)
     compute_loss = ComputeLoss(model)  # init loss class
     callbacks.run('on_train_start')
+    if opt.use_distill:
+        lambda_kl = opt.lambda_kl if opt.lambda_distill is None else opt.lambda_distill
+        LOGGER.info(f"lambda_kl={lambda_kl} (from --lambda_kl or --lambda_distill)")
+        kl_warn_count = 0
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader_s.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
@@ -357,13 +359,18 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
         mloss = torch.zeros(3, device=device)  # mean losses
         mloss_confmix = torch.zeros(3, device=device)  # mean confmix losses
+        mloss_kl = torch.zeros(1, device=device)
+        kl_running = torch.zeros(1, device=device)
+        kl_batches = 0
+        kl_nonfinite_steps = 0
+        kl_clamp_hits = 0
+        pT_min_epoch, pT_max_epoch = 1.0, 0.0
+        pS_min_epoch, pS_max_epoch = 1.0, 0.0
         if RANK != -1:
             train_loader_s.sampler.set_epoch(epoch)
             train_loader_t.sampler.set_epoch(epoch)
-            if opt.use_distill:
-                train_loader_sp.sampler.set_epoch(epoch)
         if opt.use_distill:
-            pbar = enumerate(zip(train_loader_s, train_loader_sp, train_loader_t))
+                pbar = enumerate(zip(train_loader_s, train_loader_t))
         else:
             pbar = enumerate(zip(train_loader_s, train_loader_t))
         LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
@@ -373,7 +380,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         for i, batch in pbar:  # batch -------------------------------------------------------------
             callbacks.run('on_train_batch_start')
             if opt.use_distill:
-                (imgs_s, targets_s, paths_s, _), (imgs_sp, _, paths_sp, _), (imgs_t, _, paths_t, _) = batch
+                (imgs_s, imgs_sp, targets_s, paths_s, paths_sp, _), (imgs_t, _, paths_t, _) = batch
+                imgs_sp_cpu = imgs_sp
             else:
                 (imgs_s, targets_s, paths_s, _), (imgs_t, _, paths_t, _) = batch
             ni = i + nb * epoch  # number integrated batches (since train start)
@@ -398,6 +406,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if sf != 1:
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
+                    if opt.use_distill:
+                        imgs_sp = nn.functional.interpolate(imgs_sp, size=ns, mode='bilinear', align_corners=False)
 
             # Forward
             with amp.autocast(enabled=cuda):
@@ -407,35 +417,38 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if opt.use_distill:
                     imgs_sp = imgs_sp.to(device, non_blocking=True).float() / 255
 
-                pred_s = model(
-                    imgs[: imgs_s.shape[0]], pseudo=True, delta=delta
-                )  # forward
-
-                # pseudo_s: pseudo detections on source images with the proposed confidence metric
-                # pred_s: predictions on source images
-                # var_s: variances on source images
-                pseudo_s, pred_s, var_s = pred_s
-
+                # Pseudo detections on target images
+                # pred_t: predictions on target images
+                # var_t: variances on target images
                 pred_t = model(
                     imgs[imgs_s.shape[0]:], pseudo=True, delta=delta
                 )  # forward
-
-                # pseudo_t: pseudo detections on target images with the proposed confidence metric
-                # pred_t: predictions on target images
-                # var_t: variances on target images
                 pseudo_t, pred_t, var_t = pred_t
 
                 if opt.use_distill:
                     pred_sp = model(
                         imgs_sp, pseudo=True, delta=delta
                     )  # forward
+                    # pseudo_sp: pseudo detections on translated source images
                     # pred_sp: predictions on translated source images
                     # var_sp: variances on translated source images
-                    _, pred_sp, var_sp = pred_sp
+                    pseudo_sp, pred_sp, var_sp = pred_sp
 
-                # filter pseudo detections on source images applying NMS
-                out_s = non_max_suppression(pseudo_s.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
-                out_s = output_to_target(out_s)  # x,y,w,h
+                    # filter pseudo detections on translated source images applying NMS
+                    out_s = non_max_suppression(pseudo_sp.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
+                    out_s = output_to_target(out_s)  # x,y,w,h
+                else:
+                    pred_s = model(
+                        imgs[: imgs_s.shape[0]], pseudo=True, delta=delta
+                    )  # forward
+                    # pseudo_s: pseudo detections on source images with the proposed confidence metric
+                    # pred_s: predictions on source images
+                    # var_s: variances on source images
+                    pseudo_s, pred_s, var_s = pred_s
+
+                    # filter pseudo detections on source images applying NMS
+                    out_s = non_max_suppression(pseudo_s.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
+                    out_s = output_to_target(out_s)  # x,y,w,h
 
                 # filter pseudo detections on target images applying NMS
                 out = non_max_suppression(pseudo_t.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
@@ -516,8 +529,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 targets_confmix[:, [2, 4]] /= w
                 targets_confmix[:, [3, 5]] /= h
 
-                # create confmix image
-                imgs_confmix = imgs_s*(1-mask) + imgs_t*mask
+                # create confmix image (use translated source)
+                mix_source = imgs_sp_cpu if opt.use_distill else imgs_s
+                imgs_confmix = mix_source * (1 - mask) + imgs_t * mask
+                if opt.use_distill and epoch == start_epoch and i == 0:
+                    assert imgs_confmix.shape == imgs_sp.shape == imgs_s.shape
                 imgs_confmix = imgs_confmix.to(device, non_blocking=True).float() / 255.0
 
                 pred_confmix = model(
@@ -528,49 +544,69 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 # var_confmix: variances on confmix images
                 _, pred_confmix, var_confmix = pred_confmix
                 
-                # supervised detector loss term on the labelled source samples
-                loss, loss_items = compute_loss(
-                    pred_s, targets_s.to(device), var_s
-                )
-
-                # distillation loss term on translated source samples (S')
-                loss_distill = torch.zeros(1, device=device)
-                loss_items_distill = torch.zeros(3, device=device)
+                # supervised detector loss term on the translated source samples (S')
                 if opt.use_distill:
-                    with torch.no_grad():
-                        teacher_out = teacher(imgs_sp, pseudo=True, delta=delta)
-                        pseudo_sp, _, _ = teacher_out
-                        out_sp = non_max_suppression(
-                            pseudo_sp.detach(),
-                            conf_thres=opt.distill_conf_thres,
-                            iou_thres=0.5,
-                            multi_label=False)
-                        out_sp = output_to_target(out_sp)  # x,y,w,h
-
-                    out_sp = torch.from_numpy(out_sp) if out_sp.size else torch.empty([0, 7])
-                    if out_sp.numel():
-                        _, _, h_sp, w_sp = imgs_sp.shape
-                        out_sp[:, [2, 4]] /= w_sp
-                        out_sp[:, [3, 5]] /= h_sp
-                        targets_distill = out_sp[:, :6]
-                        loss_distill, loss_items_distill = compute_loss(
-                            pred_sp, targets_distill.to(device), var_sp
-                        )
+                    loss, loss_items = compute_loss(
+                        pred_sp, targets_s.to(device), var_sp
+                    )
+                else:
+                    loss, loss_items = compute_loss(
+                        pred_s, targets_s.to(device), var_s
+                    )
 
                 # self-supervised consistency loss term on the mixed samples
                 loss_confmix, loss_items_confmix = compute_loss(
                     pred_confmix, targets_confmix.to(device), var_confmix
                 )
 
+                loss_kl = torch.zeros(1, device=device)
+                if opt.use_distill:
+                    with torch.no_grad():
+                        with amp.autocast(enabled=False):
+                            _, pred_teacher, _ = teacher(imgs[: imgs_s.shape[0]].float(), pseudo=True, delta=delta)
+
+                    if opt.debug_kl and i == 0:
+                        for pt, ps in zip(pred_teacher, pred_sp):
+                            assert pt.shape == ps.shape
+
+                    eps = 1e-4  # larger eps to avoid saturation under AMP/FP16
+                    kl_total = 0.0
+                    with amp.autocast(enabled=False):
+                        for pt, ps in zip(pred_teacher, pred_sp):
+                            p_t_raw = torch.sigmoid(pt[..., 4].float()).detach()
+                            p_s_raw = torch.sigmoid(ps[..., 4].float())
+                            kl_clamp_hits += ((p_t_raw < eps) | (p_t_raw > 1 - eps) | (p_s_raw < eps) | (p_s_raw > 1 - eps)).sum().item()
+                            pT_min_epoch = min(pT_min_epoch, float(p_t_raw.min()))
+                            pT_max_epoch = max(pT_max_epoch, float(p_t_raw.max()))
+                            pS_min_epoch = min(pS_min_epoch, float(p_s_raw.min()))
+                            pS_max_epoch = max(pS_max_epoch, float(p_s_raw.max()))
+                            p_t = p_t_raw.clamp(eps, 1 - eps)
+                            p_s = p_s_raw.clamp(eps, 1 - eps)
+                            kl = p_t * torch.log(p_t / p_s)
+                            kl += (1 - p_t) * torch.log((1 - p_t) / (1 - p_s))
+                            kl_total += kl.mean()
+                    loss_kl = kl_total / max(len(pred_teacher), 1)
+                    if not torch.isfinite(loss_kl).all():
+                        kl_nonfinite_steps += 1
+                        if RANK in {-1, 0}:
+                            if kl_warn_count < 5:
+                                LOGGER.warning(f'Non-finite L_kl detected, zeroing. value={loss_kl}')
+                                kl_warn_count += 1
+                        loss_kl = torch.zeros(1, device=device)
+                    kl_running += loss_kl.detach()
+                    kl_batches += 1
+
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
-                    loss_distill *= WORLD_SIZE
+                    loss_confmix *= WORLD_SIZE
+                    loss_kl *= WORLD_SIZE
                 if opt.quad:
                     loss *= 4.
-                    loss_distill *= 4.
+                    loss_confmix *= 4.
+                    loss_kl *= 4.
 
                 if opt.use_distill:
-                    total_loss = loss + opt.lambda_distill * loss_distill + loss_confmix * torch.nan_to_num(gamma)
+                    total_loss = loss + loss_confmix * torch.nan_to_num(gamma) + lambda_kl * loss_kl
                 else:
                     total_loss = loss + loss_confmix * torch.nan_to_num(gamma)
 
@@ -591,8 +627,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 f = save_dir / f'train_batch{epoch}.jpg'  # filename
                 plot_images(imgs_s, targets_s, paths_s, f)
 
-                f = save_dir / f'train_pred_s{epoch}.jpg'  # filename
-                plot_images(imgs_s, out_s, paths_s, f)
+                if opt.use_distill:
+                    f = save_dir / f'train_pred_sp{epoch}.jpg'  # filename
+                    plot_images(imgs_sp_cpu, out_s, paths_sp, f)
+                else:
+                    f = save_dir / f'train_pred_s{epoch}.jpg'  # filename
+                    plot_images(imgs_s, out_s, paths_s, f)
                 
                 f = save_dir / f'train_pred_t{epoch}.jpg'  # filename
                 plot_images(imgs_t, out, paths_t, f)
@@ -604,9 +644,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mloss_confmix = (mloss_confmix * i + loss_items_confmix) / (i + 1)  # update mean losses
+                if opt.use_distill:
+                    mloss_kl = loss_kl if i == 0 else (mloss_kl * i + loss_kl) / (i + 1)
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
                 pbar.set_description(('%10s' * 2 + '%10.4g' * 5) %
                                      (f'{epoch}/{epochs - 1}', mem, *mloss, targets_s.shape[0], imgs.shape[-1]))
+                if opt.use_distill:
+                    pbar.set_postfix({'L_det': float(loss), 'L_cons': float(loss_confmix), 'L_kl': float(loss_kl)})
                 callbacks.run('on_train_batch_end', ni, model, imgs[: imgs_s.shape[0]], targets_s, paths_s, plots)
                 if callbacks.stop_training:
                     return
@@ -617,6 +661,18 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         scheduler.step()
 
         if RANK in {-1, 0}:
+            if opt.use_distill:
+                l_det = float(mloss.sum())
+                l_cons = float(mloss_confmix.sum())
+                l_kl = float(mloss_kl)
+                LOGGER.info(f"L_det={l_det:.4g} L_cons={l_cons:.4g} L_kl={l_kl:.4g} lambda_kl={lambda_kl:.4g}")
+                kl_mean_epoch = float(kl_running / max(kl_batches, 1))
+                LOGGER.info(
+                    f"KL: mean={kl_mean_epoch:.4g} nonfinite_steps={kl_nonfinite_steps} clamp_hits={kl_clamp_hits} "
+                    f"pT=[{pT_min_epoch:.4g},{pT_max_epoch:.4g}] pS=[{pS_min_epoch:.4g},{pS_max_epoch:.4g}]"
+                )
+                if opt.debug_kl and kl_nonfinite_steps > 0:
+                    raise RuntimeError('Non-finite L_kl detected with --debug_kl')
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
@@ -744,9 +800,11 @@ def parse_opt(known=False):
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--max-det-pct', type=int, default=100, help='maximum percentage of pseudo-detection before mixing')
     parser.add_argument('--use_distill', action='store_true', help='enable teacher-student distillation on S\'')
-    parser.add_argument('--lambda_distill', type=float, default=0.5, help='distillation loss weight')
+    parser.add_argument('--lambda_kl', type=float, default=0.25, help='objectness KL loss weight')
+    parser.add_argument('--lambda_distill', type=float, default=None, help='deprecated (mapped to --lambda_kl)')
     parser.add_argument('--teacher_weights', type=str, default='', help='teacher weights path (trained on S only)')
-    parser.add_argument('--distill_conf_thres', type=float, default=0.5, help='distill pseudo-label conf threshold')
+    parser.add_argument('--distill_conf_thres', type=float, default=0.5, help='deprecated (unused)')
+    parser.add_argument('--debug_kl', action='store_true', help='debug KL stability (asserts on non-finite)')
 
     # Weights & Biases arguments
     parser.add_argument('--entity', default=None, help='W&B: Entity')

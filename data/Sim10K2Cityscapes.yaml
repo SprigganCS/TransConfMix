@@ -3,7 +3,7 @@
 train: # train images
   - /home/andre/datasets/samples/sim10k/images/train
 train_translated: # translated source images (CycleGAN S->T)
-  - /home/andre/datasets/samples/TRANSLATED/sample_masked_sim10k2cityscapes_512/images/train
+  - /home/andre/ConfMix/sim10k2cityscapes/images/train
 val: # val images
   # - /home/andre/ConfMix/Cityscapes/images/val/frankfurt
   # - /home/andre/ConfMix/Cityscapes/images/val/lindau

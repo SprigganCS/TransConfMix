@@ -234,21 +234,8 @@ def create_uda_dataloaders_distill(path_s,
         LOGGER.warning('WARNING: --rect is incompatible with DataLoader shuffle, setting shuffle=False')
         shuffle = False
     with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
-        dataset_s = LoadImagesAndLabels(
+        dataset_s = LoadImagesAndLabelsPair(
             path_s,
-            imgsz,
-            half_batch,
-            augment=augment,  # augmentation
-            hyp=hyp,  # hyperparameters
-            rect=rect,  # rectangular batches
-            cache_images=cache,
-            single_cls=single_cls,
-            stride=int(stride),
-            pad=pad,
-            image_weights=image_weights,
-            prefix=prefix)
-
-        dataset_sp = LoadImagesAndLabels(
             path_sp,
             imgsz,
             half_batch,
@@ -260,7 +247,8 @@ def create_uda_dataloaders_distill(path_s,
             stride=int(stride),
             pad=pad,
             image_weights=image_weights,
-            prefix=colorstr('train_translated: '))
+            prefix=prefix,
+            prefix_sp=colorstr('train_translated: '))
 
         dataset_t = LoadImagesAndLabels(
             path_t,
@@ -279,7 +267,6 @@ def create_uda_dataloaders_distill(path_s,
     nd = torch.cuda.device_count()  # number of CUDA devices
     nw = min([os.cpu_count() // max(nd, 1), batch_size if batch_size > 1 else 0, workers])  # number of workers
     sampler_s = None if rank == -1 else distributed.DistributedSampler(dataset_s, shuffle=shuffle)
-    sampler_sp = None if rank == -1 else distributed.DistributedSampler(dataset_sp, shuffle=shuffle)
     sampler_t = None if rank == -1 else distributed.DistributedSampler(dataset_t, shuffle=shuffle)
     loader = DataLoader if image_weights else InfiniteDataLoader  # only DataLoader allows for attribute updates
     dataloader_s = loader(dataset_s,
@@ -288,14 +275,7 @@ def create_uda_dataloaders_distill(path_s,
                         num_workers=nw,
                         sampler=sampler_s,
                         pin_memory=True,
-                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
-    dataloader_sp = loader(dataset_sp,
-                        batch_size=half_batch,
-                        shuffle=shuffle and sampler_sp is None,
-                        num_workers=nw,
-                        sampler=sampler_sp,
-                        pin_memory=True,
-                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
+                        collate_fn=LoadImagesAndLabelsPair.collate_fn)
     dataloader_t = loader(dataset_t,
                         batch_size=half_batch,
                         shuffle=shuffle and sampler_t is None,
@@ -303,7 +283,7 @@ def create_uda_dataloaders_distill(path_s,
                         sampler=sampler_t,
                         pin_memory=True,
                         collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
-    return dataloader_s, dataset_s, dataloader_sp, dataset_sp, dataloader_t, dataset_t
+    return dataloader_s, dataset_s, dataloader_t, dataset_t
 
 
 class InfiniteDataLoader(dataloader.DataLoader):
@@ -1008,6 +988,202 @@ class LoadImagesAndLabels(Dataset):
             lb[:, 0] = i  # add target image index for build_targets()
 
         return torch.stack(im4, 0), torch.cat(label4, 0), path4, shapes4
+
+
+class LoadImagesAndLabelsPair(LoadImagesAndLabels):
+    # Paired source/translated loader with shared geometric transforms
+    def __init__(self,
+                 path,
+                 path_sp,
+                 img_size=640,
+                 batch_size=16,
+                 augment=False,
+                 hyp=None,
+                 rect=False,
+                 image_weights=False,
+                 cache_images=False,
+                 single_cls=False,
+                 stride=32,
+                 pad=0.0,
+                 prefix='',
+                 prefix_sp=''):
+        super().__init__(
+            path,
+            img_size=img_size,
+            batch_size=batch_size,
+            augment=augment,
+            hyp=hyp,
+            rect=rect,
+            image_weights=image_weights,
+            cache_images=cache_images,
+            single_cls=single_cls,
+            stride=stride,
+            pad=pad,
+            prefix=prefix)
+
+        self.im_files_sp = self._load_image_files(path_sp, prefix_sp)
+        self._align_translated_files(prefix_sp)
+        self.ims_sp = [None] * self.n
+        self.im_hw0_sp, self.im_hw_sp = [None] * self.n, [None] * self.n
+        self.npy_files_sp = [Path(f).with_suffix('.npy') for f in self.im_files_sp]
+
+        if cache_images:
+            gb = 0
+            fcn = self.cache_images_sp_to_disk if cache_images == 'disk' else self.load_image_sp
+            results = ThreadPool(NUM_THREADS).imap(fcn, range(self.n))
+            pbar = tqdm(enumerate(results), total=self.n, bar_format=BAR_FORMAT, disable=LOCAL_RANK > 0)
+            for i, x in pbar:
+                if cache_images == 'disk':
+                    gb += self.npy_files_sp[i].stat().st_size
+                else:
+                    self.ims_sp[i], self.im_hw0_sp[i], self.im_hw_sp[i] = x
+                    gb += self.ims_sp[i].nbytes
+                pbar.desc = f'{prefix_sp}Caching images ({gb / 1E9:.1f}GB {cache_images})'
+            pbar.close()
+
+        # Disable mosaic/mixup to preserve pairing
+        self.mosaic = False
+
+    @staticmethod
+    def _load_image_files(path, prefix):
+        try:
+            f = []
+            for p in path if isinstance(path, list) else [path]:
+                p = Path(p)
+                if p.is_dir():
+                    f += glob.glob(str(p / '**' / '*.*'), recursive=True)
+                elif p.is_file():
+                    with open(p) as t:
+                        t = t.read().strip().splitlines()
+                        parent = str(p.parent) + os.sep
+                        f += [x.replace('./', parent) if x.startswith('./') else x for x in t]
+                else:
+                    raise Exception(f'{prefix}{p} does not exist')
+            files = sorted(x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS)
+            assert files, f'{prefix}No images found'
+            return files
+        except Exception as e:
+            raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {HELP_URL}')
+
+    def _align_translated_files(self, prefix_sp):
+        stem_map = {}
+        dup_stems = []
+        for p in self.im_files_sp:
+            stem = Path(p).stem
+            if stem in stem_map:
+                dup_stems.append(stem)
+            stem_map[stem] = p
+        if dup_stems:
+            raise Exception(f'{prefix_sp}Duplicate translated stems: {dup_stems[:3]}')
+
+        aligned = []
+        missing = []
+        for p in self.im_files:
+            stem = Path(p).stem
+            sp = stem_map.get(stem)
+            if sp is None:
+                missing.append(Path(p).name)
+            aligned.append(sp)
+        if missing:
+            raise Exception(f'{prefix_sp}Missing translated pairs for: {missing[:3]}')
+        self.im_files_sp = aligned
+
+    def load_image_sp(self, i):
+        im, f, fn = self.ims_sp[i], self.im_files_sp[i], self.npy_files_sp[i]
+        if im is None:
+            if fn.exists():
+                im = np.load(fn)
+            else:
+                im = cv2.imread(str(f))
+                assert im is not None, f'Image Not Found {f}'
+            h0, w0 = im.shape[:2]
+            r = self.img_size / max(h0, w0)
+            if r != 1:
+                interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                im = cv2.resize(im, (int(w0 * r), int(h0 * r)), interpolation=interp)
+            return im, (h0, w0), im.shape[:2]
+        return self.ims_sp[i], self.im_hw0_sp[i], self.im_hw_sp[i]
+
+    def cache_images_sp_to_disk(self, i):
+        f = self.npy_files_sp[i]
+        if not f.exists():
+            np.save(f.as_posix(), cv2.imread(self.im_files_sp[i]))
+
+    def __getitem__(self, index):
+        index = self.indices[index]
+
+        hyp = self.hyp
+        # Load images
+        img, (h0, w0), (h, w) = self.load_image(index)
+        img_sp, _, _ = self.load_image_sp(index)
+
+        # Letterbox (shared shape)
+        shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size
+        img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+        img_sp, _, _ = letterbox(img_sp, shape, auto=False, scaleup=self.augment)
+        shapes = (h0, w0), ((h / h0, w / w0), pad)
+
+        labels = self.labels[index].copy()
+        if labels.size:
+            labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+
+        if self.augment:
+            labels_in = labels.copy()
+            state = random.getstate()
+            img, labels = random_perspective(img,
+                                             labels,
+                                             degrees=hyp['degrees'],
+                                             translate=hyp['translate'],
+                                             scale=hyp['scale'],
+                                             shear=hyp['shear'],
+                                             perspective=hyp['perspective'])
+            random.setstate(state)
+            img_sp, _ = random_perspective(img_sp,
+                                           labels_in,
+                                           degrees=hyp['degrees'],
+                                           translate=hyp['translate'],
+                                           scale=hyp['scale'],
+                                           shear=hyp['shear'],
+                                           perspective=hyp['perspective'])
+
+        nl = len(labels)
+        if nl:
+            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1E-3)
+
+        if self.augment:
+            # HSV on translated only
+            augment_hsv(img_sp, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+
+            flipud = random.random() < hyp['flipud']
+            fliplr = random.random() < hyp['fliplr']
+            if flipud:
+                img = np.flipud(img)
+                img_sp = np.flipud(img_sp)
+                if nl:
+                    labels[:, 2] = 1 - labels[:, 2]
+            if fliplr:
+                img = np.fliplr(img)
+                img_sp = np.fliplr(img_sp)
+                if nl:
+                    labels[:, 1] = 1 - labels[:, 1]
+
+        labels_out = torch.zeros((nl, 6))
+        if nl:
+            labels_out[:, 1:] = torch.from_numpy(labels)
+
+        img = img.transpose((2, 0, 1))[::-1]
+        img_sp = img_sp.transpose((2, 0, 1))[::-1]
+        img = np.ascontiguousarray(img)
+        img_sp = np.ascontiguousarray(img_sp)
+
+        return torch.from_numpy(img), torch.from_numpy(img_sp), labels_out, self.im_files[index], self.im_files_sp[index], shapes
+
+    @staticmethod
+    def collate_fn(batch):
+        im, im_sp, label, path, path_sp, shapes = zip(*batch)
+        for i, lb in enumerate(label):
+            lb[:, 0] = i
+        return torch.stack(im, 0), torch.stack(im_sp, 0), torch.cat(label, 0), path, path_sp, shapes
 
 
 # Ancillary functions --------------------------------------------------------------------------------------------------
