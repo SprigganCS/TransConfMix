@@ -714,7 +714,28 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             if fi > best_fitness:
                 best_fitness = fi
             log_vals = list(mloss) + list(results) + lr # + list(mloss_confmix)
-            callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
+            csv_extra = None
+            if opt.use_distill:
+                if opt.kl_mask_mode in {'hard', 'soft'}:
+                    active_ratio = kl_mask_active_running / max(kl_mask_batches, 1)
+                else:
+                    active_ratio = 0.0
+                csv_extra = {
+                    'train/L_det': l_det,
+                    'train/L_cons': l_cons,
+                    'train/L_kl': l_kl,
+                    'kl/mean': kl_mean_epoch,
+                    'kl/nonfinite_steps': float(kl_nonfinite_steps),
+                    'kl/clamp_hits': float(kl_clamp_hits),
+                    'kl/pT_min': float(pT_min_epoch),
+                    'kl/pT_max': float(pT_max_epoch),
+                    'kl/pS_min': float(pS_min_epoch),
+                    'kl/pS_max': float(pS_max_epoch),
+                    'klmask/active': float(active_ratio),
+                    'klmask/tau': float(opt.kl_tau),
+                    'klmask/mode': str(opt.kl_mask_mode),
+                }
+            callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi, csv_extra=csv_extra)
 
             # Save model
             if (not nosave) or (final_epoch and not evolve):  # if save

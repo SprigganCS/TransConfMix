@@ -132,15 +132,28 @@ class Loggers():
             files = sorted(self.save_dir.glob('val*.jpg'))
             self.wandb.log({"Validation": [wandb.Image(str(f), caption=f.name) for f in files]})
 
-    def on_fit_epoch_end(self, vals, epoch, best_fitness, fi):
+    def on_fit_epoch_end(self, vals, epoch, best_fitness, fi, csv_extra=None):
         # Callback runs at the end of each fit (train+val) epoch
         x = dict(zip(self.keys, vals))
         if self.csv:
             file = self.save_dir / 'results.csv'
-            n = len(x) + 1  # number of cols
-            s = '' if file.exists() else (('%20s,' * n % tuple(['epoch'] + self.keys)).rstrip(',') + '\n')  # add header
+            csv_extra = csv_extra or {}
+            csv_keys = self.keys + list(csv_extra.keys())
+            csv_vals = list(vals) + list(csv_extra.values())
+            n = len(csv_keys) + 1  # number of cols
+            s = '' if file.exists() else (('%20s,' * n % tuple(['epoch'] + csv_keys)).rstrip(',') + '\n')
+
+            row = []
+            for v in [epoch] + csv_vals:
+                if isinstance(v, (int, float)):
+                    row.append(f'{v:20.5g}')
+                elif v is None:
+                    row.append(f'{"nan":>20}')
+                else:
+                    row.append(f'{str(v):>20}')
+
             with open(file, 'a') as f:
-                f.write(s + ('%20.5g,' * n % tuple([epoch] + vals)).rstrip(',') + '\n')
+                f.write(s + (','.join(row)).rstrip(',') + '\n')
 
         if self.tb:
             for k, v in x.items():
