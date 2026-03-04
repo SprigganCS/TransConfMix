@@ -39,7 +39,11 @@ results*.csv
 
 !media/*
 
+eval_map.py
+montar_set.py
+
 # Datasets -------------------------------------------------------------------------------------------------------------
+official_SAMPLE_sim10k2cityscapes_NOCROP_NOLOAD_latest_A2B/
 coco/
 coco128/
 VOC/
