@@ -44,6 +44,10 @@ coco/
 coco128/
 VOC/
 sim10k2cityscapes/
+SET_EXPERIMENTS/
+TRANSLATED_SOURCE_FULL_SETS/
+data/
+montar_set.py
 
 # MATLAB GitIgnore -----------------------------------------------------------------------------------------------------
 *.m~
