@@ -54,6 +54,8 @@ Sim10K/
 Sim10K_dolphins_infra/
 sim10k2cityscapes/
 nusc.tar.gz
+SET_EXPERIMENTS/
+data/
 # MATLAB GitIgnore -----------------------------------------------------------------------------------------------------
 *.m~
 *.mat
