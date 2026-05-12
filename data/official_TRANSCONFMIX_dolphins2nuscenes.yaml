@@ -1,0 +1,26 @@
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+
+
+train: # train images
+  - /home/andre/datasets/originals/dolphins_vehicle/images/train
+
+train_translated: # train images
+  - /home/andre/ConfMix/SET_EXPERIMENTS/official_SAMPLE_dolphins2nuscenes_NOCROP_NOLOAD_NOLAMBDA_PLATEAU/images/train
+
+val: # val images
+  # - /home/andre/ConfMix/Cityscapes/images/val/frankfurt
+  # - /home/andre/ConfMix/Cityscapes/images/val/lindau
+  # - /home/andre/ConfMix/Cityscapes/images/val/munster
+  - /home/andre/datasets/originals/NuScenes_car_only/images/val
+  # - /home/andre/datasets/originals/Cityscapes/images/val/all_val
+
+
+test:  # test images (optional)
+uda: 
+  - /home/andre/datasets/originals/NuScenes_car_only/images/train
+
+# Classes
+nc: 1 # number of classes
+names: ['car'] # class names
+# Download script/URL (optional)
+download:

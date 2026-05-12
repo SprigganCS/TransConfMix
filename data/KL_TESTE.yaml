@@ -1,0 +1,35 @@
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+
+train: # train images
+  - /home/andre/datasets/originals/Sim10K/images/train
+train_translated: # translated source images (CycleGAN S->T)
+  - /home/andre/ConfMix/SET_EXPERIMENTS/official_FULL_sim10k2cityscapes_PLATEAU/images/train
+val: # val images
+
+  - /home/andre/datasets/originals/Cityscapes/images/val/all_val
+test:  # test images (optional)
+uda: 
+  - /home/andre/datasets/originals/Cityscapes/images/train/aachen
+  - /home/andre/datasets/originals/Cityscapes/images/train/bochum
+  - /home/andre/datasets/originals/Cityscapes/images/train/bremen
+  - /home/andre/datasets/originals/Cityscapes/images/train/cologne
+  - /home/andre/datasets/originals/Cityscapes/images/train/darmstadt
+  - /home/andre/datasets/originals/Cityscapes/images/train/dusseldorf
+  - /home/andre/datasets/originals/Cityscapes/images/train/erfurt
+  - /home/andre/datasets/originals/Cityscapes/images/train/hamburg
+  - /home/andre/datasets/originals/Cityscapes/images/train/hanover
+  - /home/andre/datasets/originals/Cityscapes/images/train/jena
+  - /home/andre/datasets/originals/Cityscapes/images/train/krefeld
+  - /home/andre/datasets/originals/Cityscapes/images/train/monchengladbach
+  - /home/andre/datasets/originals/Cityscapes/images/train/strasbourg
+  - /home/andre/datasets/originals/Cityscapes/images/train/stuttgart
+  - /home/andre/datasets/originals/Cityscapes/images/train/tubingen
+  - /home/andre/datasets/originals/Cityscapes/images/train/ulm
+  - /home/andre/datasets/originals/Cityscapes/images/train/weimar
+  - /home/andre/datasets/originals/Cityscapes/images/train/zurich
+
+# Classes
+nc: 1 # number of classes
+names: ['car'] # class names
+# Download script/URL (optional)
+download:

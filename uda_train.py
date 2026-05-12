@@ -335,9 +335,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     compute_loss = ComputeLoss(model)  # init loss class
     callbacks.run('on_train_start')
     if opt.use_distill:
-        lambda_kl = opt.lambda_kl if opt.lambda_distill is None else opt.lambda_distill
-        LOGGER.info(f"lambda_kl={lambda_kl} (from --lambda_kl or --lambda_distill)")
-        kl_warn_count = 0
+        LOGGER.info("Teacher-student distillation enabled (L_cons2 with pseudo-labels)")
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader_s.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
@@ -359,13 +357,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
         mloss = torch.zeros(3, device=device)  # mean losses
         mloss_confmix = torch.zeros(3, device=device)  # mean confmix losses
-        mloss_kl = torch.zeros(1, device=device)
-        kl_running = torch.zeros(1, device=device)
-        kl_batches = 0
-        kl_nonfinite_steps = 0
-        kl_clamp_hits = 0
-        pT_min_epoch, pT_max_epoch = 1.0, 0.0
-        pS_min_epoch, pS_max_epoch = 1.0, 0.0
+        mloss_cons2 = torch.zeros(3, device=device)  # [box, obj, cls] from compute_loss
         if RANK != -1:
             train_loader_s.sampler.set_epoch(epoch)
             train_loader_t.sampler.set_epoch(epoch)
@@ -559,54 +551,45 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     pred_confmix, targets_confmix.to(device), var_confmix
                 )
 
-                loss_kl = torch.zeros(1, device=device)
+                loss_cons2 = torch.zeros(1, device=device)
+                loss_items_cons2 = torch.zeros(3, device=device)
+                tau = torch.zeros(1, device=device)
                 if opt.use_distill:
                     with torch.no_grad():
-                        with amp.autocast(enabled=False):
-                            _, pred_teacher, _ = teacher(imgs[: imgs_s.shape[0]].float(), pseudo=True, delta=delta)
+                        pseudo_teacher, _, _ = teacher(
+                            imgs[: imgs_s.shape[0]].float(), pseudo=True, delta=delta)
+                    out_teacher = non_max_suppression(
+                        pseudo_teacher.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
+                    out_teacher = output_to_target(out_teacher)
 
-                    if opt.debug_kl and i == 0:
-                        for pt, ps in zip(pred_teacher, pred_sp):
-                            assert pt.shape == ps.shape
+                    b_sz, _, h_img, w_img = imgs_s.shape
+                    out_teacher = torch.from_numpy(out_teacher) if out_teacher.size else torch.empty([0, 7])
 
-                    eps = 1e-4  # larger eps to avoid saturation under AMP/FP16
-                    kl_total = 0.0
-                    with amp.autocast(enabled=False):
-                        for pt, ps in zip(pred_teacher, pred_sp):
-                            p_t_raw = torch.sigmoid(pt[..., 4].float()).detach()
-                            p_s_raw = torch.sigmoid(ps[..., 4].float())
-                            kl_clamp_hits += ((p_t_raw < eps) | (p_t_raw > 1 - eps) | (p_s_raw < eps) | (p_s_raw > 1 - eps)).sum().item()
-                            pT_min_epoch = min(pT_min_epoch, float(p_t_raw.min()))
-                            pT_max_epoch = max(pT_max_epoch, float(p_t_raw.max()))
-                            pS_min_epoch = min(pS_min_epoch, float(p_s_raw.min()))
-                            pS_max_epoch = max(pS_max_epoch, float(p_s_raw.max()))
-                            p_t = p_t_raw.clamp(eps, 1 - eps)
-                            p_s = p_s_raw.clamp(eps, 1 - eps)
-                            kl = p_t * torch.log(p_t / p_s)
-                            kl += (1 - p_t) * torch.log((1 - p_t) / (1 - p_s))
-                            kl_total += kl.mean()
-                    loss_kl = kl_total / max(len(pred_teacher), 1)
-                    if not torch.isfinite(loss_kl).all():
-                        kl_nonfinite_steps += 1
-                        if RANK in {-1, 0}:
-                            if kl_warn_count < 5:
-                                LOGGER.warning(f'Non-finite L_kl detected, zeroing. value={loss_kl}')
-                                kl_warn_count += 1
-                        loss_kl = torch.zeros(1, device=device)
-                    kl_running += loss_kl.detach()
-                    kl_batches += 1
+                    c_tau_thres = 0.5
+                    if out_teacher.shape[0] > 0:
+                        tau = (out_teacher[:, 6] > c_tau_thres).sum() / out_teacher[:, 6].nelement()
+                    else:
+                        tau = torch.zeros(1, device=device)
+
+                    targets_teacher = out_teacher[:, :6]
+                    if targets_teacher.shape[0] > 0:
+                        targets_teacher[:, [2, 4]] /= w_img
+                        targets_teacher[:, [3, 5]] /= h_img
+
+                    loss_cons2, loss_items_cons2 = compute_loss(
+                        pred_sp, targets_teacher.to(device), var_sp)
 
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                     loss_confmix *= WORLD_SIZE
-                    loss_kl *= WORLD_SIZE
+                    loss_cons2 *= WORLD_SIZE
                 if opt.quad:
                     loss *= 4.
                     loss_confmix *= 4.
-                    loss_kl *= 4.
+                    loss_cons2 *= 4.
 
                 if opt.use_distill:
-                    total_loss = loss + loss_confmix * torch.nan_to_num(gamma) + lambda_kl * loss_kl
+                    total_loss = loss + loss_confmix * torch.nan_to_num(gamma) + loss_cons2 * torch.nan_to_num(tau)
                 else:
                     total_loss = loss + loss_confmix * torch.nan_to_num(gamma)
 
@@ -645,12 +628,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mloss_confmix = (mloss_confmix * i + loss_items_confmix) / (i + 1)  # update mean losses
                 if opt.use_distill:
-                    mloss_kl = loss_kl if i == 0 else (mloss_kl * i + loss_kl) / (i + 1)
+                    mloss_cons2 = loss_items_cons2 if i == 0 else (mloss_cons2 * i + loss_items_cons2) / (i + 1)
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
                 pbar.set_description(('%10s' * 2 + '%10.4g' * 5) %
                                      (f'{epoch}/{epochs - 1}', mem, *mloss, targets_s.shape[0], imgs.shape[-1]))
                 if opt.use_distill:
-                    pbar.set_postfix({'L_det': float(loss), 'L_cons': float(loss_confmix), 'L_kl': float(loss_kl)})
+                    pbar.set_postfix({
+                        'L_det': float(loss), 'L_cons': float(loss_confmix),
+                        'L_cons2': float(loss_cons2), 'tau': float(tau)})
                 callbacks.run('on_train_batch_end', ni, model, imgs[: imgs_s.shape[0]], targets_s, paths_s, plots)
                 if callbacks.stop_training:
                     return
@@ -664,15 +649,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             if opt.use_distill:
                 l_det = float(mloss.sum())
                 l_cons = float(mloss_confmix.sum())
-                l_kl = float(mloss_kl)
-                LOGGER.info(f"L_det={l_det:.4g} L_cons={l_cons:.4g} L_kl={l_kl:.4g} lambda_kl={lambda_kl:.4g}")
-                kl_mean_epoch = float(kl_running / max(kl_batches, 1))
+                l_cons2 = float(mloss_cons2.sum())
                 LOGGER.info(
-                    f"KL: mean={kl_mean_epoch:.4g} nonfinite_steps={kl_nonfinite_steps} clamp_hits={kl_clamp_hits} "
-                    f"pT=[{pT_min_epoch:.4g},{pT_max_epoch:.4g}] pS=[{pS_min_epoch:.4g},{pS_max_epoch:.4g}]"
-                )
-                if opt.debug_kl and kl_nonfinite_steps > 0:
-                    raise RuntimeError('Non-finite L_kl detected with --debug_kl')
+                    f"L_det={l_det:.4g} L_cons={l_cons:.4g} L_cons2={l_cons2:.4g} tau={float(tau):.4g}")
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
@@ -800,11 +779,7 @@ def parse_opt(known=False):
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--max-det-pct', type=int, default=100, help='maximum percentage of pseudo-detection before mixing')
     parser.add_argument('--use_distill', action='store_true', help='enable teacher-student distillation on S\'')
-    parser.add_argument('--lambda_kl', type=float, default=0.25, help='objectness KL loss weight')
-    parser.add_argument('--lambda_distill', type=float, default=None, help='deprecated (mapped to --lambda_kl)')
     parser.add_argument('--teacher_weights', type=str, default='', help='teacher weights path (trained on S only)')
-    parser.add_argument('--distill_conf_thres', type=float, default=0.5, help='deprecated (unused)')
-    parser.add_argument('--debug_kl', action='store_true', help='debug KL stability (asserts on non-finite)')
 
     # Weights & Biases arguments
     parser.add_argument('--entity', default=None, help='W&B: Entity')

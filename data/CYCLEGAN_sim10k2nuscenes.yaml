@@ -1,0 +1,15 @@
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+
+
+train: # train images
+  - /home/andre/ConfMix/SET_EXPERIMENTS/official_FULL_sim10k2nuscenes_NOCROP_NOLOAD_NOLAMBDA_PLATEAU/images/train
+val: # val images
+
+  - /home/andre/datasets/originals/NuScenes_car_only/images/val
+test:  # test images (optional)
+
+# Classes
+nc: 1 # number of classes
+names: ['car'] # class names
+# Download script/URL (optional)
+download:
