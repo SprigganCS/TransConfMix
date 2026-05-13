@@ -49,17 +49,77 @@ from utils.downloads import attempt_download
 from utils.general import (LOGGER, check_dataset, check_file, check_git_status, check_img_size, check_requirements,
                            check_suffix, check_version, check_yaml, colorstr, get_latest_run, increment_path,
                            init_seeds, intersect_dicts, labels_to_class_weights, labels_to_image_weights, methods,
-                           one_cycle, print_args, print_mutation, strip_optimizer, non_max_suppression, clip_coords_target)
+                           one_cycle, print_args, print_mutation, strip_optimizer, non_max_suppression, clip_coords_target,
+                           xywh2xyxy)
 from utils.loggers import Loggers
 from utils.loggers.wandb.wandb_utils import check_wandb_resume
 from utils.loss import ComputeLoss
-from utils.metrics import fitness
+from utils.metrics import box_iou, fitness
 from utils.plots import plot_evolve, plot_labels, output_to_target, plot_images
 from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, torch_distributed_zero_first
 
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
+
+
+def compute_tau_f1(out_teacher, targets_gt, w_img, h_img, iou_thresh=0.5):
+    """Batch F1 (binary micro, class-agnostic) between teacher NMS boxes vs source GTs.
+
+    out_teacher: [N, 7] = [img_id, cls, x, y, w, h, conf], xywh in pixels (output_to_target format).
+    targets_gt: [M, 6] = [img_id, cls, x, y, w, h], xywh normalized [0, 1] (YOLO train targets).
+    Degenerate: returns 0.0 if no preds, no GT, or both empty.
+    """
+    if out_teacher.shape[0] == 0 or targets_gt.shape[0] == 0:
+        return 0.0
+
+    pred = out_teacher.clone().float().cpu()
+    tgt = targets_gt.clone().float().cpu()
+
+    pred[:, 2] /= float(w_img)
+    pred[:, 4] /= float(w_img)
+    pred[:, 3] /= float(h_img)
+    pred[:, 5] /= float(h_img)
+
+    pred_xyxy = xywh2xyxy(pred[:, 2:6])
+    gt_xyxy = xywh2xyxy(tgt[:, 2:6])
+
+    img_ids = torch.unique(torch.cat([pred[:, 0].view(-1), tgt[:, 0].view(-1)])).long()
+
+    tp = fp = fn = 0
+    for img_id in img_ids.tolist():
+        p_mask = pred[:, 0].long() == img_id
+        g_mask = tgt[:, 0].long() == img_id
+        p_boxes = pred_xyxy[p_mask]
+        g_boxes = gt_xyxy[g_mask]
+        p_conf = pred[p_mask, 6]
+
+        if g_boxes.shape[0] == 0:
+            fp += int(p_boxes.shape[0])
+            continue
+        if p_boxes.shape[0] == 0:
+            fn += int(g_boxes.shape[0])
+            continue
+
+        order = p_conf.argsort(descending=True)
+        p_boxes = p_boxes[order]
+
+        iou_mat = box_iou(p_boxes, g_boxes)
+        gt_matched = torch.zeros(g_boxes.shape[0], dtype=torch.bool)
+
+        for k in range(p_boxes.shape[0]):
+            ious_k = iou_mat[k].clone()
+            ious_k[gt_matched] = -1.0
+            best_iou, best_j = ious_k.max(dim=0)
+            if float(best_iou) >= iou_thresh:
+                tp += 1
+                gt_matched[int(best_j)] = True
+            else:
+                fp += 1
+        fn += int((~gt_matched).sum().item())
+
+    denom = 2 * tp + fp + fn
+    return (2 * tp / denom) if denom > 0 else 0.0
 
 
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
@@ -565,11 +625,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     b_sz, _, h_img, w_img = imgs_s.shape
                     out_teacher = torch.from_numpy(out_teacher) if out_teacher.size else torch.empty([0, 7])
 
-                    c_tau_thres = 0.5
-                    if out_teacher.shape[0] > 0:
-                        tau = (out_teacher[:, 6] > c_tau_thres).sum() / out_teacher[:, 6].nelement()
-                    else:
-                        tau = torch.zeros(1, device=device)
+                    tau_f1 = compute_tau_f1(
+                        out_teacher,
+                        targets_s.detach().cpu(),
+                        w_img,
+                        h_img,
+                        iou_thresh=0.5,
+                    )
+                    tau = torch.tensor(tau_f1, device=device, dtype=torch.float32)
 
                     targets_teacher = out_teacher[:, :6]
                     if targets_teacher.shape[0] > 0:
