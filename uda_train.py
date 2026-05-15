@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import csv
 import math
 import os
 import random
@@ -68,10 +69,18 @@ def compute_tau_f1(out_teacher, targets_gt, w_img, h_img, iou_thresh=0.5):
 
     out_teacher: [N, 7] = [img_id, cls, x, y, w, h, conf], xywh in pixels (output_to_target format).
     targets_gt: [M, 6] = [img_id, cls, x, y, w, h], xywh normalized [0, 1] (YOLO train targets).
-    Degenerate: returns 0.0 if no preds, no GT, or both empty.
+
+    Returns:
+        (tau, tp, fp, fn): tau in [0, 1]; integers tp, fp, fn (n_pred = tp+fp, n_gt = tp+fn when matching runs).
     """
-    if out_teacher.shape[0] == 0 or targets_gt.shape[0] == 0:
-        return 0.0
+    n_p = out_teacher.shape[0]
+    n_g = targets_gt.shape[0]
+    if n_p == 0 and n_g == 0:
+        return 0.0, 0, 0, 0
+    if n_p == 0:
+        return 0.0, 0, 0, int(n_g)
+    if n_g == 0:
+        return 0.0, 0, int(n_p), 0
 
     pred = out_teacher.clone().float().cpu()
     tgt = targets_gt.clone().float().cpu()
@@ -119,7 +128,8 @@ def compute_tau_f1(out_teacher, targets_gt, w_img, h_img, iou_thresh=0.5):
         fn += int((~gt_matched).sum().item())
 
     denom = 2 * tp + fp + fn
-    return (2 * tp / denom) if denom > 0 else 0.0
+    tau = (2 * tp / denom) if denom > 0 else 0.0
+    return tau, tp, fp, fn
 
 
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
@@ -143,8 +153,23 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     if not evolve:
         with open(save_dir / 'hyp.yaml', 'w') as f:
             yaml.safe_dump(hyp, f, sort_keys=False)
+        opt.seed = int(getattr(opt, 'seed', 0))  # sempre presente no opt.yaml (p.ex. resume de runs antigos)
         with open(save_dir / 'opt.yaml', 'w') as f:
             yaml.safe_dump(vars(opt), f, sort_keys=False)
+
+    tau_batch_path = tau_epoch_path = None
+    if opt.use_distill and RANK in {-1, 0}:
+        tau_batch_path = save_dir / 'tau_batch.csv'
+        tau_epoch_path = save_dir / 'tau_epoch.csv'
+        _tau_batch_header = 'epoch,batch,tau,tp,fp,fn,n_pred,n_gt,gamma\n'
+        _tau_epoch_header = 'epoch,ldet,gamma,lcons,tau,lcons2\n'
+        for _path, _hdr in ((tau_batch_path, _tau_batch_header), (tau_epoch_path, _tau_epoch_header)):
+            if not resume:
+                with open(_path, 'w', encoding='utf-8') as _f:
+                    _f.write(_hdr)
+            elif not _path.exists() or _path.stat().st_size == 0:
+                with open(_path, 'w', encoding='utf-8') as _f:
+                    _f.write(_hdr)
 
     # Loggers
     data_dict = None
@@ -162,7 +187,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     # Config
     plots = not evolve and not opt.noplots  # create plots
     cuda = device.type != 'cpu'
-    init_seeds()
+    _seed = int(getattr(opt, 'seed', 0))
+    init_seeds(_seed)
+    LOGGER.info(f'Random seed {_seed}')
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)  # check if None
     train_path, val_path, uda_path = data_dict['train'], data_dict['val'], data_dict['uda']
@@ -418,6 +445,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         mloss = torch.zeros(3, device=device)  # mean losses
         mloss_confmix = torch.zeros(3, device=device)  # mean confmix losses
         mloss_cons2 = torch.zeros(3, device=device)  # [box, obj, cls] from compute_loss
+        if opt.use_distill and RANK in {-1, 0} and tau_batch_path is not None:
+            e_sum_tau = 0.0
+            e_sum_gamma = 0.0
+            e_n_tau_batches = 0
         if RANK != -1:
             train_loader_s.sampler.set_epoch(epoch)
             train_loader_t.sampler.set_epoch(epoch)
@@ -573,8 +604,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 targets_confmix = torch.cat((targets_confmix_s, targets_confmix_t))
 
                 c_gamma_thres = 0.5
-                gamma = (targets_confmix[:,6] > c_gamma_thres).sum() / \
-                                (targets_confmix[:,6]).nelement()
+                conf_gamma = targets_confmix[:, 6]
+                n_conf_gamma = int(conf_gamma.numel())
+                if n_conf_gamma > 0:
+                    gamma = (conf_gamma > c_gamma_thres).sum() / n_conf_gamma
+                else:
+                    gamma = conf_gamma.new_zeros(())
+                gamma = torch.nan_to_num(gamma, nan=0.0, posinf=0.0, neginf=0.0)
 
                 targets_confmix = targets_confmix[:,:6] # remove confidence values
                 # normalize
@@ -625,7 +661,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     b_sz, _, h_img, w_img = imgs_s.shape
                     out_teacher = torch.from_numpy(out_teacher) if out_teacher.size else torch.empty([0, 7])
 
-                    tau_f1 = compute_tau_f1(
+                    n_pred = int(out_teacher.shape[0])
+                    n_gt = int(targets_s.shape[0])
+
+                    tau_f1, tp_b, fp_b, fn_b = compute_tau_f1(
                         out_teacher,
                         targets_s.detach().cpu(),
                         w_img,
@@ -633,6 +672,16 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                         iou_thresh=0.5,
                     )
                     tau = torch.tensor(tau_f1, device=device, dtype=torch.float32)
+
+                    if tau_batch_path is not None:
+                        e_sum_tau += tau_f1
+                        e_sum_gamma += float(gamma.item())
+                        e_n_tau_batches += 1
+                        with open(tau_batch_path, 'a', newline='', encoding='utf-8') as _f:
+                            csv.writer(_f).writerow(
+                                [epoch, i, f'{tau_f1:.6f}', tp_b, fp_b, fn_b, n_pred, n_gt, f'{float(gamma.item()):.6f}']
+                            )
+                            _f.flush()
 
                     targets_teacher = out_teacher[:, :6]
                     if targets_teacher.shape[0] > 0:
@@ -713,6 +762,19 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 l_det = float(mloss.sum())
                 l_cons = float(mloss_confmix.sum())
                 l_cons2 = float(mloss_cons2.sum())
+                if tau_epoch_path is not None:
+                    tau_mean = (e_sum_tau / e_n_tau_batches) if e_n_tau_batches > 0 else 0.0
+                    gamma_mean = (e_sum_gamma / e_n_tau_batches) if e_n_tau_batches > 0 else 0.0
+                    with open(tau_epoch_path, 'a', newline='', encoding='utf-8') as _f:
+                        csv.writer(_f).writerow([
+                            epoch,
+                            f'{l_det:.6f}',
+                            f'{gamma_mean:.6f}',
+                            f'{l_cons:.6f}',
+                            f'{tau_mean:.6f}',
+                            f'{l_cons2:.6f}',
+                        ])
+                        _f.flush()
                 LOGGER.info(
                     f"L_det={l_det:.4g} L_cons={l_cons:.4g} L_cons2={l_cons2:.4g} tau={float(tau):.4g}")
             # mAP
@@ -837,6 +899,7 @@ def parse_opt(known=False):
     parser.add_argument('--cos-lr', action='store_true', help='cosine LR scheduler')
     parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon')
     parser.add_argument('--patience', type=int, default=100, help='EarlyStopping patience (epochs without improvement)')
+    parser.add_argument('--seed', type=int, default=0, help='random seed for reproducibility')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone=10, first3=0 1 2')
     parser.add_argument('--save-period', type=int, default=-1, help='Save checkpoint every x epochs (disabled if < 1)')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')

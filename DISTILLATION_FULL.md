@@ -45,7 +45,12 @@ Por imagem do batch:
 \tau = \frac{2\,\mathrm{TP}}{2\,\mathrm{TP} + \mathrm{FP} + \mathrm{FN}}
 \]
 
-**Casos degenerados:** se não houver predições, não houver GT, ou o denominador for zero → $\tau = 0$ (zera o termo $\tau\,L_{cons2}$ nesse batch).
+**Casos degenerados** (TP/FP/FN inteiros; $\tau = 0$ para não inflar $L_{cons2}$ quando não há sinal):
+
+- Sem predições e sem GT: $\mathrm{TP}=\mathrm{FP}=\mathrm{FN}=0$.
+- Sem predições, com GT: $\mathrm{FN}=|\mathrm{GT}|$, $\mathrm{TP}=\mathrm{FP}=0$.
+- Com predições, sem GT: $\mathrm{FP}=|\mathrm{pred}|$, $\mathrm{TP}=\mathrm{FN}=0$.
+- Denominador $2\,\mathrm{TP}+\mathrm{FP}+\mathrm{FN}=0$: $\tau=0$.
 
 O NMS do teacher continua com `conf_thres=0.25`, `iou_thres=0.5`; não há filtro extra de confiança só para o F1.
 
@@ -107,6 +112,29 @@ No fim de cada época:
 L_det=0.042 L_cons=0.030 L_cons2=0.036 tau=0.70
 ```
 
+(o `tau` nessa linha é o valor do **último batch** da época; a média por época está em `tau_epoch.csv` na coluna `tau`.)
+
+## Arquivos `tau_batch.csv` e `tau_epoch.csv`
+
+Com `--use_distill`, só **rank 0** (`RANK` 0 ou `-1` em single-GPU) grava em `save_dir/` (mesmo diretório que `hyp.yaml` / `results.csv`):
+
+| Arquivo | Conteúdo |
+|--------|-----------|
+| `tau_batch.csv` | Uma linha por batch: `epoch`, `batch`, `tau`, `tp`, `fp`, `fn`, `n_pred`, `n_gt`, `gamma`. |
+| `tau_epoch.csv` | Uma linha por época: `epoch`, `ldet`, `gamma`, `lcons`, `tau`, `lcons2` — `ldet`/`lcons`/`lcons2` são as médias época das três losses (soma box+obj+cls de cada ramo, como no log `L_det`/`L_cons`/`L_cons2`); `gamma` e `tau` são **médias** dos valores por batch nessa época (no rank que gravou). |
+
+Definições:
+
+- **`n_pred`**: número de detecções do teacher **após NMS** no batch (`out_teacher`), as mesmas usadas no matching IoU vs GT.
+- **`n_gt`**: número de GT de source no batch (`targets_s`).
+- **`gamma` (por batch)**: fração de pseudo-labels do ConfMix nesse batch com confiança **> 0.5**, dividida pelo número de caixas em `targets_confmix` antes de truncar a coluna de conf — o mesmo escalar que pesa `L_cons` na loss total. No arquivo de época, `gamma` é a média desses valores por batch.
+
+**`tau` (no CSV de época)**: média aritmética dos `tau` por batch (F1 teacher vs GT no batch). TP/FP/FN por batch continuam em `tau_batch.csv`.
+
+**DDP:** com várias GPUs, o CSV reflete só os batches processados pelo **rank 0** (subconjunto da época). Single-GPU = época completa.
+
+**Resume:** se `resume` e o arquivo já existir com dados, novas linhas são **append**; em treino novo (`not resume`), os CSVs são reiniciados com header.
+
 ## Comparação com versão anterior (KL denso)
 
 | Aspecto | KL denso (anterior) | L_cons2 (atual) |
@@ -119,4 +147,4 @@ L_det=0.042 L_cons=0.030 L_cons2=0.036 tau=0.70
 
 ## Arquivos alterados
 
-- `uda_train.py` — loop de treino, args, logs
+- `uda_train.py` — loop de treino, args, logs, `compute_tau_f1`, CSVs tau
