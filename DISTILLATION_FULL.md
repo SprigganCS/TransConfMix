@@ -29,9 +29,11 @@ $$L_{cons2} = h_{box} \cdot L_{box}^{CIoU} + h_{obj} \cdot L_{obj}^{BCE} + h_{cl
 
 onde $h_{box}, h_{obj}, h_{cls}$ são os hyperparâmetros do YOLOv5 (mesmos usados em L_det e L_cons).
 
-### Peso tau (F1 micro de detecção vs GT)
+### Peso tau (F1 micro de detecção vs GT, ou constante)
 
-$\tau$ passou a ser o **F1 score** entre as pseudo-detecções do teacher (após NMS em `x_s`) e o **ground truth de `x_s`** (`targets_s`), **agregado no batch inteiro** (micro: um único TP/FP/FN somando todas as imagens do batch).
+Por defeito (CONS2), $\tau$ é o **F1 score** entre as pseudo-detecções do teacher (após NMS em `x_s`) e o **ground truth de `x_s`** (`targets_s`), **agregado no batch inteiro** (micro: um único TP/FP/FN somando todas as imagens do batch).
+
+Com **`--tau-const V`** (float), o mesmo peso **V** é usado em todos os batches — **não** se calcula F1; útil para ablações. $\gamma$ e o cálculo de $L_{cons}$ não mudam.
 
 Com **uma classe** (`nc=1`), F1 micro e macro coincidem; o matching é **agnostico à classe** (não há filtro por `cls`).
 
@@ -63,7 +65,7 @@ $\gamma$ continua sendo a fração de pseudo-boxes do ConfMix com `conf > 0.5` (
 1. **Teacher** recebe `x_s` (imagem source original) com `pseudo=True`
 2. Saída do teacher passa por **NMS** (conf_thres=0.25, iou_thres=0.5)
 3. Pseudo-labels são formatadas como targets `[image_idx, class, x, y, w, h]` normalizados
-4. **tau** = F1 (micro, IoU≥0.5) teacher vs GT de `x_s` no batch (ver seção “Peso tau”)
+4. **tau** = F1 (micro, IoU≥0.5) teacher vs GT de `x_s` no batch **ou** valor fixo se `--tau-const` (ver “Peso tau”)
 5. `compute_loss(pred_sp, targets_teacher, var_sp)` calcula a loss
 6. Contribuição na loss total: `tau * L_cons2`
 
@@ -73,7 +75,7 @@ $\gamma$ continua sendo a fração de pseudo-boxes do ConfMix com `conf > 0.5` (
 |---|---|---|
 | Input do modelo | student(confmix(x'_s, x_t)) | student(x'_s) |
 | Targets | pseudo-labels de student source + teacher target, combinadas no mix | pseudo-labels do teacher em x_s |
-| Peso | gamma (fração conf>0.5 nas pseudo do mix) | tau (F1 teacher vs GT, IoU≥0.5) |
+| Peso | gamma (fração conf>0.5 nas pseudo do mix) | tau (F1 teacher vs GT, IoU≥0.5) ou `--tau-const` |
 | Propósito | Consistência cross-domain no mix | Destilação de conhecimento teacher→student |
 
 ## Argumentos CLI
@@ -82,10 +84,9 @@ $\gamma$ continua sendo a fração de pseudo-boxes do ConfMix com `conf > 0.5` (
 |---|---|
 | `--use_distill` | Habilita L_cons2 com teacher |
 | `--teacher_weights` | Caminho dos pesos do teacher |
+| `--tau-const` | Opcional. Peso fixo para $\tau$ (ignora F1). Sem esta flag, $\tau$ = F1 por batch (CONS2). |
 
-Tau é calculado **por batch** a partir do F1 (sem parâmetro CLI).
-
-Gamma continua automático como antes.
+Sem `--tau-const`, tau é calculado **por batch** a partir do F1. Gamma continua automático como antes.
 
 ### Exemplo de uso
 
@@ -120,8 +121,8 @@ Com `--use_distill`, só **rank 0** (`RANK` 0 ou `-1` em single-GPU) grava em `s
 
 | Arquivo | Conteúdo |
 |--------|-----------|
-| `tau_batch.csv` | Uma linha por batch: `epoch`, `batch`, `tau`, `tp`, `fp`, `fn`, `n_pred`, `n_gt`, `gamma`. |
-| `tau_epoch.csv` | Uma linha por época: `epoch`, `ldet`, `gamma`, `lcons`, `tau`, `lcons2` — `ldet`/`lcons`/`lcons2` são as médias época das três losses (soma box+obj+cls de cada ramo, como no log `L_det`/`L_cons`/`L_cons2`); `gamma` e `tau` são **médias** dos valores por batch nessa época (no rank que gravou). |
+| `tau_batch.csv` | Uma linha por batch: `epoch`, `batch`, `tau`, `tp`, `fp`, `fn`, `n_pred`, `n_gt`, `gamma`. **Apenas no modo CONS2** (sem `--tau-const`); com peso fixo o ficheiro fica só com o header (sem linhas por batch). |
+| `tau_epoch.csv` | Uma linha por época: `epoch`, `ldet`, `gamma`, `lcons`, `tau`, `lcons2` — `ldet`/`lcons`/`lcons2` são as médias época das três losses (soma box+obj+cls de cada ramo, como no log `L_det`/`L_cons`/`L_cons2`); `gamma` e `tau` são **médias** dos valores por batch nessa época (no rank que gravou). Com `--tau-const`, a coluna `tau` na prática coincide com esse escalar. |
 
 Definições:
 
@@ -129,7 +130,7 @@ Definições:
 - **`n_gt`**: número de GT de source no batch (`targets_s`).
 - **`gamma` (por batch)**: fração de pseudo-labels do ConfMix nesse batch com confiança **> 0.5**, dividida pelo número de caixas em `targets_confmix` antes de truncar a coluna de conf — o mesmo escalar que pesa `L_cons` na loss total. No arquivo de época, `gamma` é a média desses valores por batch.
 
-**`tau` (no CSV de época)**: média aritmética dos `tau` por batch (F1 teacher vs GT no batch). TP/FP/FN por batch continuam em `tau_batch.csv`.
+**`tau` (no CSV de época)**: média aritmética dos pesos $\tau$ por batch (F1 em modo CONS2, ou valor fixo com `--tau-const`). TP/FP/FN por batch só em `tau_batch.csv` no modo CONS2.
 
 **DDP:** com várias GPUs, o CSV reflete só os batches processados pelo **rank 0** (subconjunto da época). Single-GPU = época completa.
 

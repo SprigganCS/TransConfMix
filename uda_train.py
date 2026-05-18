@@ -445,7 +445,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         mloss = torch.zeros(3, device=device)  # mean losses
         mloss_confmix = torch.zeros(3, device=device)  # mean confmix losses
         mloss_cons2 = torch.zeros(3, device=device)  # [box, obj, cls] from compute_loss
-        if opt.use_distill and RANK in {-1, 0} and tau_batch_path is not None:
+        if opt.use_distill and RANK in {-1, 0} and tau_epoch_path is not None:
             e_sum_tau = 0.0
             e_sum_gamma = 0.0
             e_n_tau_batches = 0
@@ -658,35 +658,40 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                         pseudo_teacher.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
                     out_teacher = output_to_target(out_teacher)
 
-                    b_sz, _, h_img, w_img = imgs_s.shape
+                    _, _, h_img, w_img = imgs_s.shape
                     out_teacher = torch.from_numpy(out_teacher) if out_teacher.size else torch.empty([0, 7])
-
-                    n_pred = int(out_teacher.shape[0])
-                    n_gt = int(targets_s.shape[0])
-
-                    tau_f1, tp_b, fp_b, fn_b = compute_tau_f1(
-                        out_teacher,
-                        targets_s.detach().cpu(),
-                        w_img,
-                        h_img,
-                        iou_thresh=0.5,
-                    )
-                    tau = torch.tensor(tau_f1, device=device, dtype=torch.float32)
-
-                    if tau_batch_path is not None:
-                        e_sum_tau += tau_f1
-                        e_sum_gamma += float(gamma.item())
-                        e_n_tau_batches += 1
-                        with open(tau_batch_path, 'a', newline='', encoding='utf-8') as _f:
-                            csv.writer(_f).writerow(
-                                [epoch, i, f'{tau_f1:.6f}', tp_b, fp_b, fn_b, n_pred, n_gt, f'{float(gamma.item()):.6f}']
-                            )
-                            _f.flush()
 
                     targets_teacher = out_teacher[:, :6]
                     if targets_teacher.shape[0] > 0:
                         targets_teacher[:, [2, 4]] /= w_img
                         targets_teacher[:, [3, 5]] /= h_img
+
+                    if getattr(opt, 'tau_const', None) is not None:
+                        tau = torch.tensor(opt.tau_const, device=device, dtype=torch.float32)
+                        tau_for_log = float(opt.tau_const)
+                    else:
+                        tau_f1, tp_b, fp_b, fn_b = compute_tau_f1(
+                            out_teacher,
+                            targets_s.detach().cpu(),
+                            w_img,
+                            h_img,
+                            iou_thresh=0.5,
+                        )
+                        tau = torch.tensor(tau_f1, device=device, dtype=torch.float32)
+                        tau_for_log = float(tau_f1)
+                        if tau_batch_path is not None:
+                            n_pred = int(out_teacher.shape[0])
+                            n_gt = int(targets_s.shape[0])
+                            with open(tau_batch_path, 'a', newline='', encoding='utf-8') as _f:
+                                csv.writer(_f).writerow(
+                                    [epoch, i, f'{tau_f1:.6f}', tp_b, fp_b, fn_b, n_pred, n_gt, f'{float(gamma.item()):.6f}']
+                                )
+                                _f.flush()
+
+                    if tau_epoch_path is not None:
+                        e_sum_tau += tau_for_log
+                        e_sum_gamma += float(gamma.item())
+                        e_n_tau_batches += 1
 
                     loss_cons2, loss_items_cons2 = compute_loss(
                         pred_sp, targets_teacher.to(device), var_sp)
@@ -906,6 +911,13 @@ def parse_opt(known=False):
     parser.add_argument('--max-det-pct', type=int, default=100, help='maximum percentage of pseudo-detection before mixing')
     parser.add_argument('--use_distill', action='store_true', help='enable teacher-student distillation on S\'')
     parser.add_argument('--teacher_weights', type=str, default='', help='teacher weights path (trained on S only)')
+    parser.add_argument(
+        '--tau-const',
+        type=float,
+        default=None,
+        dest='tau_const',
+        help='if set, fixed τ weight for L_cons2 (no F1); omit for CONS2 dynamic τ from teacher vs GT',
+    )
 
     # Weights & Biases arguments
     parser.add_argument('--entity', default=None, help='W&B: Entity')
@@ -923,6 +935,8 @@ def main(opt, callbacks=Callbacks()):
         print_args(vars(opt))
         check_git_status()
         check_requirements(exclude=['thop'])
+        if getattr(opt, 'tau_const', None) is not None and not opt.use_distill:
+            LOGGER.warning('--tau-const is ignored without --use_distill')
 
     # Resume
     if opt.resume and not check_wandb_resume(opt) and not opt.evolve:  # resume an interrupted run
