@@ -5,6 +5,7 @@ Loss functions
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from utils.metrics import bbox_iou
 from utils.torch_utils import de_parallel
@@ -118,16 +119,18 @@ class ComputeLoss:
         self.anchors = m.anchors
         self.device = device
 
-    def __call__(self, p, targets, var=None):  # predictions, targets, variances
+    def __call__(self, p, targets, var=None, target_weights=None):  # predictions, targets, variances
         lcls = torch.zeros(1, device=self.device)  # class loss
         lbox = torch.zeros(1, device=self.device)  # box loss
         lobj = torch.zeros(1, device=self.device)  # object loss
-        tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
+        tcls, tbox, indices, anchors, tweights = self.build_targets(p, targets, target_weights)
+        _eps = 1e-8
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
             b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
             tobj = torch.zeros(pi.shape[:4], dtype=pi.dtype, device=self.device)  # target obj
+            w = tweights[i]
 
             n = b.shape[0]  # number of targets
             if n:
@@ -140,7 +143,16 @@ class ComputeLoss:
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
 
-                if var is not None:
+                if w is not None:
+                    w_sum = w.sum() + _eps
+                    if var is not None:
+                        vars = var[i][b, a, gj, gi]
+                        # Gaussian is [n, 4]; collapse to [n] like (1-Gaussian).mean() over last dim
+                        gloss = (1.0 - self.Gaussian(tbox[i], pbox, vars)).mean(dim=1).view(-1)
+                        lbox += (gloss * w.view(-1)).sum() / w_sum
+                    else:
+                        lbox += ((1.0 - iou).view(-1) * w.view(-1)).sum() / w_sum
+                elif var is not None:
                     vars = var[i][b, a, gj, gi]
                     lbox += (1.0 - self.Gaussian(tbox[i], pbox, vars)).mean()  # new loss
                 else:
@@ -148,9 +160,12 @@ class ComputeLoss:
 
                 # Objectness
                 iou = iou.detach().clamp(0).type(tobj.dtype)
+                if w is not None:
+                    w = w.view(-1)
                 if self.sort_obj_iou:
                     j = iou.argsort()
                     b, a, gj, gi, iou = b[j], a[j], gj[j], gi[j], iou[j]
+                    # w not reordered: lbox/lcls use pre-sort alignment with pcls (sort_obj_iou is False by default)
                 if self.gr < 1:
                     iou = (1.0 - self.gr) + self.gr * iou
                 tobj[b, a, gj, gi] = iou  # iou ratio
@@ -159,7 +174,10 @@ class ComputeLoss:
                 if self.nc > 1:  # cls loss (only if multiple classes)
                     t = torch.full_like(pcls, self.cn, device=self.device)  # targets
                     t[range(n), tcls[i]] = self.cp
-                    lcls += self.BCEcls(pcls, t)  # BCE
+                    if w is not None:
+                        lcls += self._weighted_bce_cls(pcls, t, w, _eps)
+                    else:
+                        lcls += self.BCEcls(pcls, t)  # BCE
 
                 # Append targets to text file
                 # with open('targets.txt', 'a') as file:
@@ -179,13 +197,39 @@ class ComputeLoss:
 
         return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
 
-    def build_targets(self, p, targets):
+    def _weighted_bce_cls(self, pcls, t, w, eps):
+        """Per-positive weighted mean cls loss (Focal modulating factors when fl_gamma > 0)."""
+        pw = None
+        base = self.BCEcls
+        if isinstance(base, FocalLoss):
+            inner = base.loss_fcn
+            if getattr(inner, 'pos_weight', None) is not None:
+                pw = inner.pos_weight
+        elif getattr(base, 'pos_weight', None) is not None:
+            pw = base.pos_weight
+        raw = F.binary_cross_entropy_with_logits(pcls, t, reduction='none', pos_weight=pw)
+        if isinstance(self.BCEcls, FocalLoss):
+            pred_prob = torch.sigmoid(pcls)
+            p_t = t * pred_prob + (1 - t) * (1 - pred_prob)
+            alpha_factor = t * self.BCEcls.alpha + (1 - t) * (1 - self.BCEcls.alpha)
+            modulating_factor = (1.0 - p_t) ** self.BCEcls.gamma
+            raw = raw * alpha_factor * modulating_factor
+        w_sum = w.sum() + eps
+        return (raw.mean(-1) * w).sum() / w_sum
+
+    def build_targets(self, p, targets, target_weights=None):
         # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
-        tcls, tbox, indices, anch = [], [], [], []
+        tcls, tbox, indices, anch, tweights = [], [], [], [], []
         gain = torch.ones(7, device=self.device).long()  # normalized to gridspace gain
         ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
         targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)  # append anchor indices
+        if target_weights is not None:
+            if target_weights.shape[0] != nt:
+                raise ValueError(f'target_weights length {target_weights.shape[0]} != nt {nt}')
+            tw_grid = target_weights.to(self.device).float().view(1, nt).expand(na, nt).contiguous()
+        else:
+            tw_grid = None
 
         g = 0.5  # bias
         off = torch.tensor(
@@ -205,21 +249,29 @@ class ComputeLoss:
 
             # Match targets to anchors
             t = targets * gain  # shape(3,n,7)
+            tw_cur = None
             if nt:
+                if tw_grid is not None:
+                    tw_cur = tw_grid
                 # Matches
                 r = t[..., 4:6] / anchors[:, None]  # wh ratio
                 j = torch.max(r, 1 / r).max(2)[0] < self.hyp['anchor_t']  # compare
                 # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
                 t = t[j]  # filter
+                if tw_cur is not None:
+                    tw_cur = tw_cur[j]
 
                 # Offsets
                 gxy = t[:, 2:4]  # grid xy
                 gxi = gain[[2, 3]] - gxy  # inverse
                 j, k = ((gxy % 1 < g) & (gxy > 1)).T
                 l, m = ((gxi % 1 < g) & (gxi > 1)).T
-                j = torch.stack((torch.ones_like(j), j, k, l, m))
-                t = t.repeat((5, 1, 1))[j]
-                offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
+                j_off = torch.stack((torch.ones_like(j), j, k, l, m))
+                t = t.repeat((5, 1, 1))[j_off]
+                if tw_cur is not None:
+                    tw_exp = tw_cur.unsqueeze(0).repeat(5, 1)
+                    tw_cur = tw_exp[j_off]
+                offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j_off]
             else:
                 t = targets[0]
                 offsets = 0
@@ -235,8 +287,9 @@ class ComputeLoss:
             tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
             anch.append(anchors[a])  # anchors
             tcls.append(c)  # class
+            tweights.append(tw_cur)
 
-        return tcls, tbox, indices, anch
+        return tcls, tbox, indices, anch, tweights
 
     def Gaussian(self, y, mu, var):
         """

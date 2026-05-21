@@ -132,6 +132,43 @@ def compute_tau_f1(out_teacher, targets_gt, w_img, h_img, iou_thresh=0.5):
     return tau, tp, fp, fn
 
 
+def lcons2_teacher_box_weights(out_teacher, targets_gt, w_img, h_img, mode):
+    """Per-box weights for Exp 4; order matches rows of out_teacher / targets_teacher.
+
+    out_teacher: [N, 7] pixel xywh + conf. targets_gt: [M, 6] normalized xywh.
+    mode: teacher_conf | teacher_iou_maxgt | teacher_conf_iou
+    """
+    if out_teacher.numel() == 0:
+        return torch.empty(0, dtype=torch.float32)
+    dev = torch.device('cpu')
+    pred = out_teacher.detach().float().cpu().clone()
+    pred[:, 2] /= float(w_img)
+    pred[:, 4] /= float(w_img)
+    pred[:, 3] /= float(h_img)
+    pred[:, 5] /= float(h_img)
+    pred_xyxy = xywh2xyxy(pred[:, 2:6])
+    tgt = targets_gt.detach().float().cpu()
+    gt_xyxy = xywh2xyxy(tgt[:, 2:6])
+    n = pred.shape[0]
+    conf = pred[:, 6].clamp(0.0, 1.0)
+    if mode == 'teacher_conf':
+        return conf
+    w = torch.zeros(n, device=dev, dtype=torch.float32)
+    for i in range(n):
+        bid = int(pred[i, 0].item())
+        g_mask = tgt[:, 0].long() == bid
+        if g_mask.any():
+            ious = box_iou(pred_xyxy[i : i + 1], gt_xyxy[g_mask]).view(-1)
+            iou_max = ious.max()
+        else:
+            iou_max = torch.tensor(0.0)
+        if mode == 'teacher_iou_maxgt':
+            w[i] = iou_max
+        else:  # teacher_conf_iou
+            w[i] = conf[i] * iou_max
+    return w
+
+
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
     save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze, max_det_pct = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
@@ -200,6 +237,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
     if opt.use_distill:
         assert train_translated_path, f'Missing train_translated in {data}'
+
+    _lcons2_mode = getattr(opt, 'lcons2_box_weight', 'none') or 'none'
+    _per_box_lcons2 = _lcons2_mode != 'none'
 
     # Model
     check_suffix(weights, '.pt')  # check weights
@@ -423,6 +463,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     callbacks.run('on_train_start')
     if opt.use_distill:
         LOGGER.info("Teacher-student distillation enabled (L_cons2 with pseudo-labels)")
+        if _per_box_lcons2:
+            LOGGER.info(f'L_cons2 per-box weights: {_lcons2_mode} (no global τ on L_cons2)')
+        if _per_box_lcons2 and getattr(opt, 'tau_const', None) is not None:
+            LOGGER.warning('--tau-const is ignored when --lcons2-box-weight is not none')
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader_s.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
@@ -650,6 +694,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 loss_cons2 = torch.zeros(1, device=device)
                 loss_items_cons2 = torch.zeros(3, device=device)
                 tau = torch.zeros(1, device=device)
+                tau_for_log = 0.0
                 if opt.use_distill:
                     with torch.no_grad():
                         pseudo_teacher, _, _ = teacher(
@@ -661,40 +706,60 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     _, _, h_img, w_img = imgs_s.shape
                     out_teacher = torch.from_numpy(out_teacher) if out_teacher.size else torch.empty([0, 7])
 
+                    tw = None
+                    if _per_box_lcons2:
+                        tau = torch.zeros(1, device=device, dtype=torch.float32)
+                        if out_teacher.shape[0] > 0:
+                            tw = lcons2_teacher_box_weights(
+                                out_teacher.float(),
+                                targets_s.detach().float(),
+                                w_img,
+                                h_img,
+                                _lcons2_mode,
+                            )
+                            tau_for_log = float(tw.mean().item()) if tw.numel() else 0.0
+                        else:
+                            tau_for_log = 0.0
+                    else:
+                        if getattr(opt, 'tau_const', None) is not None:
+                            tau = torch.tensor(opt.tau_const, device=device, dtype=torch.float32)
+                            tau_for_log = float(opt.tau_const)
+                        else:
+                            tau_f1, tp_b, fp_b, fn_b = compute_tau_f1(
+                                out_teacher,
+                                targets_s.detach().cpu(),
+                                w_img,
+                                h_img,
+                                iou_thresh=0.5,
+                            )
+                            tau = torch.tensor(tau_f1, device=device, dtype=torch.float32)
+                            tau_for_log = float(tau_f1)
+                            if tau_batch_path is not None:
+                                n_pred = int(out_teacher.shape[0])
+                                n_gt = int(targets_s.shape[0])
+                                with open(tau_batch_path, 'a', newline='', encoding='utf-8') as _f:
+                                    csv.writer(_f).writerow(
+                                        [epoch, i, f'{tau_f1:.6f}', tp_b, fp_b, fn_b, n_pred, n_gt, f'{float(gamma.item()):.6f}']
+                                    )
+                                    _f.flush()
+
                     targets_teacher = out_teacher[:, :6]
                     if targets_teacher.shape[0] > 0:
                         targets_teacher[:, [2, 4]] /= w_img
                         targets_teacher[:, [3, 5]] /= h_img
 
-                    if getattr(opt, 'tau_const', None) is not None:
-                        tau = torch.tensor(opt.tau_const, device=device, dtype=torch.float32)
-                        tau_for_log = float(opt.tau_const)
+                    if _per_box_lcons2:
+                        if tw is not None and targets_teacher.shape[0] > 0:
+                            loss_cons2, loss_items_cons2 = compute_loss(
+                                pred_sp, targets_teacher.to(device), var_sp, target_weights=tw.to(device))
                     else:
-                        tau_f1, tp_b, fp_b, fn_b = compute_tau_f1(
-                            out_teacher,
-                            targets_s.detach().cpu(),
-                            w_img,
-                            h_img,
-                            iou_thresh=0.5,
-                        )
-                        tau = torch.tensor(tau_f1, device=device, dtype=torch.float32)
-                        tau_for_log = float(tau_f1)
-                        if tau_batch_path is not None:
-                            n_pred = int(out_teacher.shape[0])
-                            n_gt = int(targets_s.shape[0])
-                            with open(tau_batch_path, 'a', newline='', encoding='utf-8') as _f:
-                                csv.writer(_f).writerow(
-                                    [epoch, i, f'{tau_f1:.6f}', tp_b, fp_b, fn_b, n_pred, n_gt, f'{float(gamma.item()):.6f}']
-                                )
-                                _f.flush()
+                        loss_cons2, loss_items_cons2 = compute_loss(
+                            pred_sp, targets_teacher.to(device), var_sp)
 
                     if tau_epoch_path is not None:
                         e_sum_tau += tau_for_log
                         e_sum_gamma += float(gamma.item())
                         e_n_tau_batches += 1
-
-                    loss_cons2, loss_items_cons2 = compute_loss(
-                        pred_sp, targets_teacher.to(device), var_sp)
 
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
@@ -706,7 +771,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     loss_cons2 *= 4.
 
                 if opt.use_distill:
-                    total_loss = loss + loss_confmix * torch.nan_to_num(gamma) + loss_cons2 * torch.nan_to_num(tau)
+                    if _per_box_lcons2:
+                        total_loss = loss + loss_confmix * torch.nan_to_num(gamma) + loss_cons2
+                    else:
+                        total_loss = loss + loss_confmix * torch.nan_to_num(gamma) + loss_cons2 * torch.nan_to_num(tau)
                 else:
                     total_loss = loss + loss_confmix * torch.nan_to_num(gamma)
 
@@ -750,9 +818,15 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 pbar.set_description(('%10s' * 2 + '%10.4g' * 5) %
                                      (f'{epoch}/{epochs - 1}', mem, *mloss, targets_s.shape[0], imgs.shape[-1]))
                 if opt.use_distill:
-                    pbar.set_postfix({
+                    postfix = {
                         'L_det': float(loss), 'L_cons': float(loss_confmix),
-                        'L_cons2': float(loss_cons2), 'tau': float(tau)})
+                        'L_cons2': float(loss_cons2)}
+                    if _per_box_lcons2:
+                        postfix['w_bar'] = tau_for_log
+                        postfix['tau'] = 0.0
+                    else:
+                        postfix['tau'] = float(tau)
+                    pbar.set_postfix(postfix)
                 callbacks.run('on_train_batch_end', ni, model, imgs[: imgs_s.shape[0]], targets_s, paths_s, plots)
                 if callbacks.stop_training:
                     return
@@ -767,21 +841,25 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 l_det = float(mloss.sum())
                 l_cons = float(mloss_confmix.sum())
                 l_cons2 = float(mloss_cons2.sum())
+                tau_mean_ep = (e_sum_tau / e_n_tau_batches) if e_n_tau_batches > 0 else 0.0
+                gamma_mean = (e_sum_gamma / e_n_tau_batches) if e_n_tau_batches > 0 else 0.0
                 if tau_epoch_path is not None:
-                    tau_mean = (e_sum_tau / e_n_tau_batches) if e_n_tau_batches > 0 else 0.0
-                    gamma_mean = (e_sum_gamma / e_n_tau_batches) if e_n_tau_batches > 0 else 0.0
                     with open(tau_epoch_path, 'a', newline='', encoding='utf-8') as _f:
                         csv.writer(_f).writerow([
                             epoch,
                             f'{l_det:.6f}',
                             f'{gamma_mean:.6f}',
                             f'{l_cons:.6f}',
-                            f'{tau_mean:.6f}',
+                            f'{tau_mean_ep:.6f}',
                             f'{l_cons2:.6f}',
                         ])
                         _f.flush()
-                LOGGER.info(
-                    f"L_det={l_det:.4g} L_cons={l_cons:.4g} L_cons2={l_cons2:.4g} tau={float(tau):.4g}")
+                if _per_box_lcons2:
+                    LOGGER.info(
+                        f"L_det={l_det:.4g} L_cons={l_cons:.4g} L_cons2={l_cons2:.4g} w_bar_mean={tau_mean_ep:.4g}")
+                else:
+                    LOGGER.info(
+                        f"L_det={l_det:.4g} L_cons={l_cons:.4g} L_cons2={l_cons2:.4g} tau={float(tau):.4g}")
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
@@ -918,6 +996,13 @@ def parse_opt(known=False):
         dest='tau_const',
         help='if set, fixed τ weight for L_cons2 (no F1); omit for CONS2 dynamic τ from teacher vs GT',
     )
+    parser.add_argument(
+        '--lcons2-box-weight',
+        type=str,
+        default='none',
+        choices=('none', 'teacher_conf', 'teacher_iou_maxgt', 'teacher_conf_iou'),
+        help='Exp 4: per-teacher-box weights inside L_cons2 (no global τ on L_cons2 when not none)',
+    )
 
     # Weights & Biases arguments
     parser.add_argument('--entity', default=None, help='W&B: Entity')
@@ -937,6 +1022,11 @@ def main(opt, callbacks=Callbacks()):
         check_requirements(exclude=['thop'])
         if getattr(opt, 'tau_const', None) is not None and not opt.use_distill:
             LOGGER.warning('--tau-const is ignored without --use_distill')
+        _lb = getattr(opt, 'lcons2_box_weight', 'none') or 'none'
+        if _lb != 'none' and not opt.use_distill:
+            LOGGER.warning('--lcons2-box-weight is ignored without --use_distill')
+        if _lb != 'none' and getattr(opt, 'tau_const', None) is not None and opt.use_distill:
+            LOGGER.warning('--tau-const is ignored when --lcons2-box-weight is not none')
 
     # Resume
     if opt.resume and not check_wandb_resume(opt) and not opt.evolve:  # resume an interrupted run
