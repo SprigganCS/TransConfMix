@@ -102,7 +102,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     # Config
     plots = not evolve and not opt.noplots  # create plots
     cuda = device.type != 'cpu'
-    init_seeds()
+    init_seeds(opt.seed)
+    LOGGER.info(f'Random seed {opt.seed}')
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)  # check if None
     train_path, val_path, uda_path = data_dict['train'], data_dict['val'], data_dict['uda']
@@ -222,6 +223,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
     # Teacher (distillation)
     teacher = None
+    teacher_ema = None
     if opt.use_distill:
         assert opt.teacher_weights, '--teacher_weights is required when --use_distill'
         check_suffix(opt.teacher_weights, '.pt')
@@ -229,6 +231,15 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         teacher.eval()
         for p in teacher.parameters():
             p.requires_grad = False
+        if opt.ema_teacher:
+            teacher_ema = ModelEMA(model, decay=opt.ema_teacher_decay)
+            teacher_ema.decay = lambda x: opt.ema_teacher_decay  # fixed decay (no ramp)
+            t_ckpt = torch.load(opt.teacher_weights, map_location='cpu')
+            t_sd = (t_ckpt.get('ema') or t_ckpt['model']).float().state_dict()
+            csd = intersect_dicts(t_sd, teacher_ema.ema.state_dict())
+            teacher_ema.ema.load_state_dict(csd, strict=False)
+            LOGGER.info(f'Teacher EMA initialized from {opt.teacher_weights} ({len(csd)}/{len(teacher_ema.ema.state_dict())} keys)')
+            del t_ckpt, t_sd, csd
 
     # Trainloader
     print("Unsupervised Domain Adaptation training")
@@ -336,6 +347,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     callbacks.run('on_train_start')
     if opt.use_distill:
         LOGGER.info("Teacher-student distillation enabled (L_cons2 with pseudo-labels)")
+        if opt.ema_teacher:
+            LOGGER.info(f'EMA teacher enabled (decay={opt.ema_teacher_decay}, warmup={opt.ema_teacher_warmup} iters)')
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader_s.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
@@ -556,7 +569,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 tau = torch.zeros(1, device=device)
                 if opt.use_distill:
                     with torch.no_grad():
-                        pseudo_teacher, _, _ = teacher(
+                        teacher_infer = teacher_ema.ema if opt.ema_teacher else teacher
+                        pseudo_teacher, _, _ = teacher_infer(
                             imgs[: imgs_s.shape[0]].float(), pseudo=True, delta=delta)
                     out_teacher = non_max_suppression(
                         pseudo_teacher.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
@@ -603,6 +617,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 optimizer.zero_grad()
                 if ema:
                     ema.update(model)
+                if teacher_ema is not None and ni > opt.ema_teacher_warmup:
+                    teacher_ema.update(model)
                 last_opt_step = ni
                 
             # Plot
@@ -780,6 +796,10 @@ def parse_opt(known=False):
     parser.add_argument('--max-det-pct', type=int, default=100, help='maximum percentage of pseudo-detection before mixing')
     parser.add_argument('--use_distill', action='store_true', help='enable teacher-student distillation on S\'')
     parser.add_argument('--teacher_weights', type=str, default='', help='teacher weights path (trained on S only)')
+    parser.add_argument('--seed', type=int, default=0, help='random seed for reproducibility')
+    parser.add_argument('--ema-teacher', action='store_true', help='use EMA teacher for L_cons2')
+    parser.add_argument('--ema-teacher-decay', type=float, default=0.9996, help='EMA teacher decay')
+    parser.add_argument('--ema-teacher-warmup', type=int, default=100, help='iterations before first EMA teacher update')
 
     # Weights & Biases arguments
     parser.add_argument('--entity', default=None, help='W&B: Entity')
@@ -793,6 +813,7 @@ def parse_opt(known=False):
 
 def main(opt, callbacks=Callbacks()):
     # Checks
+    assert not opt.ema_teacher or opt.use_distill, '--ema-teacher requires --use_distill'
     if RANK in {-1, 0}:
         print_args(vars(opt))
         check_git_status()
