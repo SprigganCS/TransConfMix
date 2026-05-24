@@ -569,9 +569,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 tau = torch.zeros(1, device=device)
                 if opt.use_distill:
                     with torch.no_grad():
-                        teacher_infer = teacher_ema.ema if opt.ema_teacher else teacher
-                        pseudo_teacher, _, _ = teacher_infer(
-                            imgs[: imgs_s.shape[0]].float(), pseudo=True, delta=delta)
+                        if opt.ema_teacher:
+                            teacher_infer = teacher_ema.ema
+                            teacher_input = imgs_sp  # xs' — same input as student
+                        else:
+                            teacher_infer = teacher
+                            teacher_input = imgs[: imgs_s.shape[0]].float()  # xs — CONS2 original behavior
+                        pseudo_teacher, _, _ = teacher_infer(teacher_input, pseudo=True, delta=delta)
                     out_teacher = non_max_suppression(
                         pseudo_teacher.detach(), conf_thres=0.25, iou_thres=0.5, multi_label=False)
                     out_teacher = output_to_target(out_teacher)

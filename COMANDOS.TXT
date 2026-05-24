@@ -23,5 +23,5 @@ comando da branch kl-loss
 python uda_train.py   --data data/Sim10K2Cityscapes.yaml   --weights /home/andre/ConfMix/runs/train/SAMPLE_MODELS/sim10k_sample/weights/last.pt   --teacher_weights /home/andre/ConfMix/runs/train/SAMPLE_MODELS/sim10k_sample/weights/last.pt   --use_distill   --lambda_kl 0.5   --epochs 50   --batch-size 2   --img 600   --workers 4   --name confmix_klobj_mixSprime_lk0p1_lambda0.5
 
 
-comando da branch cons2ema
+comando da branch cons2ema // cons2ema2
 time python uda_train.py   --data data/KL_TESTE.yaml   --weights runs/train/FULL_MODELS/sim10k_FULL/weights/last.pt   --teacher_weights runs/train/FULL_MODELS/sim10k_FULL/weights/last.pt   --use_distill --ema-teacher   --epochs 50 --batch-size 2 --img 600 --workers 4 --seed 1   --name CONS2_sim10k2city_EMA_2
